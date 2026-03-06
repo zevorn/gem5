@@ -32,13 +32,17 @@ import unittest
 # ======================================================================
 
 # Message types from QEMU's mi300x_gem5.h
-MI300X_MSG_MMIO_READ  = 0x01
-MI300X_MSG_MMIO_WRITE = 0x02
-MI300X_MSG_DB_READ    = 0x03
-MI300X_MSG_DB_WRITE   = 0x04
-MI300X_MSG_DMA_REQ    = 0x05
-MI300X_MSG_INIT       = 0x06
-MI300X_MSG_SHUTDOWN   = 0x07
+MI300X_MSG_MMIO_READ    = 0x01
+MI300X_MSG_MMIO_WRITE   = 0x02
+MI300X_MSG_DB_READ      = 0x03
+MI300X_MSG_DB_WRITE     = 0x04
+MI300X_MSG_DMA_REQ      = 0x05
+MI300X_MSG_INIT         = 0x06
+MI300X_MSG_SHUTDOWN     = 0x07
+MI300X_MSG_CONFIG_READ  = 0x08
+MI300X_MSG_CONFIG_WRITE = 0x09
+MI300X_MSG_FRAME_READ   = 0x0A
+MI300X_MSG_FRAME_WRITE  = 0x0B
 
 MI300X_MSG_MMIO_RESP  = 0x81
 MI300X_MSG_IRQ_RAISE  = 0x82
@@ -131,6 +135,10 @@ class TestProtocolLayout(unittest.TestCase):
         self.assertEqual(MI300X_MSG_DMA_REQ, 0x05)
         self.assertEqual(MI300X_MSG_INIT, 0x06)
         self.assertEqual(MI300X_MSG_SHUTDOWN, 0x07)
+        self.assertEqual(MI300X_MSG_CONFIG_READ, 0x08)
+        self.assertEqual(MI300X_MSG_CONFIG_WRITE, 0x09)
+        self.assertEqual(MI300X_MSG_FRAME_READ, 0x0A)
+        self.assertEqual(MI300X_MSG_FRAME_WRITE, 0x0B)
 
         # gem5 -> QEMU
         self.assertEqual(MI300X_MSG_MMIO_RESP, 0x81)
@@ -419,6 +427,232 @@ class TestSocketProtocol(unittest.TestCase):
         client.close()
         self.server_thread.join(timeout=2)
 
+    def test_dma_req_write(self):
+        """Test DMA_REQ with payload (DMA write from QEMU to gem5 VRAM)."""
+        dma_addr = 0x200000
+        payload = bytes(range(128))
+        received_msgs = []
+
+        def server_handler(conn):
+            data = conn.recv(MSG_HDR_SIZE)
+            msg = unpack_msg(data)
+            received_msgs.append(msg)
+            # Read the DMA payload
+            if msg['size'] > 0:
+                payload_data = conn.recv(msg['size'])
+                received_msgs.append(payload_data)
+
+        self._start_server(server_handler)
+        client = self._connect_client()
+
+        write_msg = pack_msg(
+            msg_type=MI300X_MSG_DMA_REQ,
+            msg_id=20,
+            addr=dma_addr,
+            data=len(payload),
+            size=len(payload),
+        )
+        client.sendall(write_msg)
+        client.sendall(payload)
+
+        time.sleep(0.1)
+        client.close()
+        self.server_thread.join(timeout=2)
+
+        self.assertEqual(len(received_msgs), 2)
+        self.assertEqual(received_msgs[0]['type'], MI300X_MSG_DMA_REQ)
+        self.assertEqual(received_msgs[0]['addr'], dma_addr)
+        self.assertEqual(received_msgs[0]['size'], len(payload))
+        self.assertEqual(received_msgs[1], payload)
+
+    def test_dma_req_read(self):
+        """Test DMA_REQ without payload (DMA read from gem5 VRAM)."""
+        dma_addr = 0x300000
+        dma_len = 64
+        fake_vram_data = bytes([0xAB] * dma_len)
+
+        def server_handler(conn):
+            data = conn.recv(MSG_HDR_SIZE)
+            msg = unpack_msg(data)
+            self.assertEqual(msg['type'], MI300X_MSG_DMA_REQ)
+            self.assertEqual(msg['size'], 0)  # No payload = read request
+
+            # gem5 reads VRAM and sends response
+            resp = pack_msg(
+                msg_type=MI300X_MSG_MMIO_RESP,
+                msg_id=msg['id'],
+                addr=dma_addr,
+                data=dma_len,
+                size=dma_len,
+            )
+            conn.sendall(resp)
+            conn.sendall(fake_vram_data)
+
+        self._start_server(server_handler)
+        client = self._connect_client()
+
+        read_msg = pack_msg(
+            msg_type=MI300X_MSG_DMA_REQ,
+            msg_id=21,
+            addr=dma_addr,
+            data=dma_len,
+            size=0,  # No payload = read request
+        )
+        client.sendall(read_msg)
+
+        resp_data = client.recv(MSG_HDR_SIZE)
+        resp = unpack_msg(resp_data)
+        self.assertEqual(resp['type'], MI300X_MSG_MMIO_RESP)
+        self.assertEqual(resp['size'], dma_len)
+
+        payload = client.recv(dma_len)
+        self.assertEqual(payload, fake_vram_data)
+
+        client.close()
+        self.server_thread.join(timeout=2)
+
+    def test_config_read_roundtrip(self):
+        """Test CONFIG_READ -> MMIO_RESP roundtrip for PCI config space."""
+        test_offset = 0x00  # VendorID/DeviceID
+        test_value = 0x74A11002  # MI300X DeviceID=0x74A1, VendorID=0x1002
+
+        def server_handler(conn):
+            data = conn.recv(MSG_HDR_SIZE)
+            msg = unpack_msg(data)
+            self.assertEqual(msg['type'], MI300X_MSG_CONFIG_READ)
+            self.assertEqual(msg['addr'], test_offset)
+
+            resp = pack_msg(
+                msg_type=MI300X_MSG_MMIO_RESP,
+                msg_id=msg['id'],
+                addr=test_offset,
+                data=test_value,
+                access_size=4,
+            )
+            conn.sendall(resp)
+
+        self._start_server(server_handler)
+        client = self._connect_client()
+
+        read_msg = pack_msg(
+            msg_type=MI300X_MSG_CONFIG_READ,
+            msg_id=50,
+            addr=test_offset,
+            access_size=4,
+        )
+        client.sendall(read_msg)
+
+        resp_data = client.recv(MSG_HDR_SIZE)
+        resp = unpack_msg(resp_data)
+        self.assertEqual(resp['type'], MI300X_MSG_MMIO_RESP)
+        self.assertEqual(resp['data'], test_value)
+        self.assertEqual(resp['id'], 50)
+
+        client.close()
+        self.server_thread.join(timeout=2)
+
+    def test_config_write_fire_and_forget(self):
+        """Test CONFIG_WRITE (no response expected)."""
+        test_offset = 0x04  # PCI Command register
+        test_value = 0x0007  # IO + Mem + BusMaster
+        received = []
+
+        def server_handler(conn):
+            data = conn.recv(MSG_HDR_SIZE)
+            msg = unpack_msg(data)
+            received.append(msg)
+
+        self._start_server(server_handler)
+        client = self._connect_client()
+
+        write_msg = pack_msg(
+            msg_type=MI300X_MSG_CONFIG_WRITE,
+            msg_id=51,
+            addr=test_offset,
+            data=test_value,
+            access_size=4,
+        )
+        client.sendall(write_msg)
+
+        time.sleep(0.1)
+        client.close()
+        self.server_thread.join(timeout=2)
+
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0]['type'], MI300X_MSG_CONFIG_WRITE)
+        self.assertEqual(received[0]['addr'], test_offset)
+        self.assertEqual(received[0]['data'], test_value)
+
+    def test_frame_read_roundtrip(self):
+        """Test FRAME_READ -> MMIO_RESP roundtrip for VRAM access."""
+        test_offset = 0x1000
+        test_value = 0xDEADBEEF
+
+        def server_handler(conn):
+            data = conn.recv(MSG_HDR_SIZE)
+            msg = unpack_msg(data)
+            self.assertEqual(msg['type'], MI300X_MSG_FRAME_READ)
+
+            resp = pack_msg(
+                msg_type=MI300X_MSG_MMIO_RESP,
+                msg_id=msg['id'],
+                addr=test_offset,
+                data=test_value,
+                access_size=4,
+            )
+            conn.sendall(resp)
+
+        self._start_server(server_handler)
+        client = self._connect_client()
+
+        read_msg = pack_msg(
+            msg_type=MI300X_MSG_FRAME_READ,
+            msg_id=60,
+            addr=test_offset,
+            access_size=4,
+        )
+        client.sendall(read_msg)
+
+        resp_data = client.recv(MSG_HDR_SIZE)
+        resp = unpack_msg(resp_data)
+        self.assertEqual(resp['type'], MI300X_MSG_MMIO_RESP)
+        self.assertEqual(resp['data'], test_value)
+
+        client.close()
+        self.server_thread.join(timeout=2)
+
+    def test_frame_write_fire_and_forget(self):
+        """Test FRAME_WRITE (no response expected)."""
+        test_offset = 0x2000
+        test_value = 0xCAFEBABE
+        received = []
+
+        def server_handler(conn):
+            data = conn.recv(MSG_HDR_SIZE)
+            msg = unpack_msg(data)
+            received.append(msg)
+
+        self._start_server(server_handler)
+        client = self._connect_client()
+
+        write_msg = pack_msg(
+            msg_type=MI300X_MSG_FRAME_WRITE,
+            msg_id=61,
+            addr=test_offset,
+            data=test_value,
+            access_size=4,
+        )
+        client.sendall(write_msg)
+
+        time.sleep(0.1)
+        client.close()
+        self.server_thread.join(timeout=2)
+
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0]['type'], MI300X_MSG_FRAME_WRITE)
+        self.assertEqual(received[0]['addr'], test_offset)
+        self.assertEqual(received[0]['data'], test_value)
+
     def test_shutdown_message(self):
         """Test SHUTDOWN message from QEMU."""
         received = []
@@ -680,6 +914,14 @@ class TestDriverInitSimulation(unittest.TestCase):
         mmhub_top = (0x8000 + 0x4000) >> 24
         mem_size = 16 * 1024  # 16 GB in MB
 
+        # PCI config space (offset -> value)
+        config_map = {
+            0x00: 0x74A11002,  # DeviceID:VendorID (MI300X)
+            0x04: 0x00100007,  # Status:Command (Mem+IO+BusMaster)
+            0x08: 0x03800000,  # Class code (VGA)
+            0x2C: 0x0C341002,  # SubsystemID:SubsystemVendorID
+        }
+
         # Register map: offset -> value (what gem5 would return)
         reg_map = {
             AMDGPU_MP0_SMN_C2PMSG_33: 0x80000000,
@@ -724,6 +966,22 @@ class TestDriverInitSimulation(unittest.TestCase):
                 elif msg['type'] == MI300X_MSG_DB_WRITE:
                     # Doorbell writes are fire-and-forget
                     pass
+                elif msg['type'] == MI300X_MSG_CONFIG_READ:
+                    addr = msg['addr']
+                    value = config_map.get(addr, 0)
+                    resp = pack_msg(msg_type=MI300X_MSG_MMIO_RESP,
+                                   msg_id=msg['id'], addr=addr,
+                                   data=value, access_size=4)
+                    mmio_conn.sendall(resp)
+                elif msg['type'] == MI300X_MSG_CONFIG_WRITE:
+                    config_map[msg['addr']] = msg['data']
+                elif msg['type'] == MI300X_MSG_FRAME_READ:
+                    resp = pack_msg(msg_type=MI300X_MSG_MMIO_RESP,
+                                   msg_id=msg['id'], addr=msg['addr'],
+                                   data=0, access_size=4)
+                    mmio_conn.sendall(resp)
+                elif msg['type'] == MI300X_MSG_FRAME_WRITE:
+                    pass  # fire-and-forget
 
             mmio_conn.close()
 
@@ -742,6 +1000,16 @@ class TestDriverInitSimulation(unittest.TestCase):
         resp = unpack_msg(client.recv(MSG_HDR_SIZE))
         self.assertEqual(resp['type'], MI300X_MSG_INIT_RESP)
         self.assertEqual(resp['data'], 16 * 1024**3)
+
+        # Step 1.5: Read PCI config space (VendorID/DeviceID)
+        client.sendall(pack_msg(msg_type=MI300X_MSG_CONFIG_READ, msg_id=1,
+                               addr=0x00, access_size=4))
+        resp = unpack_msg(client.recv(MSG_HDR_SIZE))
+        self.assertEqual(resp['data'], 0x74A11002)  # MI300X
+
+        # Enable PCI BusMaster (config write, fire-and-forget)
+        client.sendall(pack_msg(msg_type=MI300X_MSG_CONFIG_WRITE, msg_id=1,
+                               addr=0x04, data=0x00100007, access_size=4))
 
         # Step 2: Read MP0 firmware status
         client.sendall(pack_msg(msg_type=MI300X_MSG_MMIO_READ, msg_id=1,
@@ -823,6 +1091,10 @@ class TestSourceCodeAlignment(unittest.TestCase):
         self.assertIn('DoorbellWrite  = 0x04', content)
         self.assertIn('Init           = 0x06', content)
         self.assertIn('Shutdown       = 0x07', content)
+        self.assertIn('ConfigRead     = 0x08', content)
+        self.assertIn('ConfigWrite    = 0x09', content)
+        self.assertIn('FrameRead      = 0x0A', content)
+        self.assertIn('FrameWrite     = 0x0B', content)
         self.assertIn('MmioResp       = 0x81', content)
         self.assertIn('IrqRaise       = 0x82', content)
         self.assertIn('IrqLower       = 0x83', content)

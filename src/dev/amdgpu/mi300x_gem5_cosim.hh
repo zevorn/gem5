@@ -65,6 +65,10 @@ enum class CosimMsgType : uint32_t
     DmaReq         = 0x05,
     Init           = 0x06,
     Shutdown       = 0x07,
+    ConfigRead     = 0x08,
+    ConfigWrite    = 0x09,
+    FrameRead      = 0x0A,
+    FrameWrite     = 0x0B,
 
     /* gem5 -> QEMU */
     MmioResp       = 0x81,
@@ -164,8 +168,13 @@ class MI300XGem5Cosim : public SimObject
     void handleMmioWrite(int fd, const CosimMsgHeader &msg);
     void handleDoorbellRead(int fd, const CosimMsgHeader &msg);
     void handleDoorbellWrite(int fd, const CosimMsgHeader &msg);
+    void handleDmaReq(int fd, const CosimMsgHeader &msg);
     void handleInit(int fd, const CosimMsgHeader &msg);
     void handleShutdown(int fd, const CosimMsgHeader &msg);
+    void handleConfigRead(int fd, const CosimMsgHeader &msg);
+    void handleConfigWrite(int fd, const CosimMsgHeader &msg);
+    void handleFrameRead(int fd, const CosimMsgHeader &msg);
+    void handleFrameWrite(int fd, const CosimMsgHeader &msg);
 
     // -- I/O helpers --
 
@@ -181,6 +190,8 @@ class MI300XGem5Cosim : public SimObject
     void gpuDoorbellWrite(uint64_t offset, uint32_t size, uint64_t data);
     uint64_t gpuFrameRead(uint64_t offset, uint32_t size);
     void gpuFrameWrite(uint64_t offset, uint32_t size, uint64_t data);
+    uint64_t gpuConfigRead(uint64_t offset, uint32_t size);
+    void gpuConfigWrite(uint64_t offset, uint32_t size, uint64_t data);
 
     // -- Shared memory (VRAM) --
 

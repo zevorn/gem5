@@ -319,11 +319,26 @@ MI300XGem5Cosim::processMessage(int fd, const CosimMsgHeader &msg)
       case CosimMsgType::DoorbellWrite:
         handleDoorbellWrite(fd, msg);
         break;
+      case CosimMsgType::DmaReq:
+        handleDmaReq(fd, msg);
+        break;
       case CosimMsgType::Init:
         handleInit(fd, msg);
         break;
       case CosimMsgType::Shutdown:
         handleShutdown(fd, msg);
+        break;
+      case CosimMsgType::ConfigRead:
+        handleConfigRead(fd, msg);
+        break;
+      case CosimMsgType::ConfigWrite:
+        handleConfigWrite(fd, msg);
+        break;
+      case CosimMsgType::FrameRead:
+        handleFrameRead(fd, msg);
+        break;
+      case CosimMsgType::FrameWrite:
+        handleFrameWrite(fd, msg);
         break;
       default:
         warn("MI300XCosim: unknown message type 0x%x", msg.type);
@@ -434,6 +449,144 @@ MI300XGem5Cosim::handleDoorbellWrite(int fd, const CosimMsgHeader &msg)
     gpuDoorbellWrite(msg.addr, accessSize, msg.data);
 
     // Doorbell writes are fire-and-forget (QEMU sends NULL response)
+}
+
+void
+MI300XGem5Cosim::handleDmaReq(int fd, const CosimMsgHeader &msg)
+{
+    // DmaReq from QEMU: addr = system memory address, data = length,
+    // size = payload size following header (for writes).
+    //
+    // For a DMA write (QEMU->gem5 VRAM): payload follows the header.
+    // For a DMA read (gem5 VRAM->QEMU): gem5 reads VRAM and sends back.
+    uint64_t addr = msg.addr;
+    uint64_t len = msg.data;
+
+    DPRINTF(MI300XCosim,
+            "DMA Request: addr=0x%lx len=%lu payload_size=%u\n",
+            addr, len, msg.size);
+
+    if (msg.size > 0) {
+        // DMA write: QEMU sends payload to write into VRAM via shared memory
+        uint32_t payloadSize = msg.size;
+        if (payloadSize > COSIM_DMA_BUF_SIZE) {
+            warn("MI300XCosim: DMA write payload too large: %u", payloadSize);
+            return;
+        }
+        if (!recvAll(fd, dmaBuf, payloadSize)) {
+            closeClient(fd);
+            return;
+        }
+
+        // If shared memory is available, copy into VRAM region
+        if (shmemPtr != MAP_FAILED && addr < vramSize) {
+            size_t copyLen = std::min((size_t)payloadSize,
+                                      (size_t)(vramSize - addr));
+            memcpy(static_cast<uint8_t *>(shmemPtr) + addr, dmaBuf, copyLen);
+        }
+    } else {
+        // DMA read: gem5 reads from VRAM shared memory and sends back
+        if (len > COSIM_DMA_BUF_SIZE)
+            len = COSIM_DMA_BUF_SIZE;
+
+        if (shmemPtr != MAP_FAILED && addr < vramSize) {
+            size_t copyLen = std::min((size_t)len,
+                                      (size_t)(vramSize - addr));
+            memcpy(dmaBuf, static_cast<uint8_t *>(shmemPtr) + addr, copyLen);
+        } else {
+            memset(dmaBuf, 0, len);
+        }
+
+        CosimMsgHeader resp{};
+        resp.type = static_cast<uint32_t>(CosimMsgType::MmioResp);
+        resp.id = msg.id;
+        resp.addr = addr;
+        resp.data = len;
+        resp.size = len;
+
+        if (!sendAll(fd, &resp, COSIM_MSG_HDR_SIZE)) {
+            closeClient(fd);
+            return;
+        }
+        if (!sendAll(fd, dmaBuf, len)) {
+            closeClient(fd);
+            return;
+        }
+    }
+}
+
+void
+MI300XGem5Cosim::handleConfigRead(int fd, const CosimMsgHeader &msg)
+{
+    uint32_t accessSize = msg.access_size;
+    if (accessSize == 0 || accessSize > 8)
+        accessSize = 4;
+
+    uint64_t value = gpuConfigRead(msg.addr, accessSize);
+
+    DPRINTF(MI300XCosim,
+            "Config Read: offset=0x%lx access_size=%u -> value=0x%lx\n",
+            msg.addr, accessSize, value);
+
+    CosimMsgHeader resp{};
+    resp.type = static_cast<uint32_t>(CosimMsgType::MmioResp);
+    resp.id = msg.id;
+    resp.addr = msg.addr;
+    resp.data = value;
+    resp.access_size = accessSize;
+    resp.size = 0;
+    sendMsg(fd, resp);
+}
+
+void
+MI300XGem5Cosim::handleConfigWrite(int fd, const CosimMsgHeader &msg)
+{
+    uint32_t accessSize = msg.access_size;
+    if (accessSize == 0 || accessSize > 8)
+        accessSize = 4;
+
+    DPRINTF(MI300XCosim,
+            "Config Write: offset=0x%lx access_size=%u value=0x%lx\n",
+            msg.addr, accessSize, msg.data);
+
+    gpuConfigWrite(msg.addr, accessSize, msg.data);
+}
+
+void
+MI300XGem5Cosim::handleFrameRead(int fd, const CosimMsgHeader &msg)
+{
+    uint32_t accessSize = msg.access_size;
+    if (accessSize == 0 || accessSize > 8)
+        accessSize = 4;
+
+    uint64_t value = gpuFrameRead(msg.addr, accessSize);
+
+    DPRINTF(MI300XCosim,
+            "Frame Read: offset=0x%lx access_size=%u -> value=0x%lx\n",
+            msg.addr, accessSize, value);
+
+    CosimMsgHeader resp{};
+    resp.type = static_cast<uint32_t>(CosimMsgType::MmioResp);
+    resp.id = msg.id;
+    resp.addr = msg.addr;
+    resp.data = value;
+    resp.access_size = accessSize;
+    resp.size = 0;
+    sendMsg(fd, resp);
+}
+
+void
+MI300XGem5Cosim::handleFrameWrite(int fd, const CosimMsgHeader &msg)
+{
+    uint32_t accessSize = msg.access_size;
+    if (accessSize == 0 || accessSize > 8)
+        accessSize = 4;
+
+    DPRINTF(MI300XCosim,
+            "Frame Write: offset=0x%lx access_size=%u value=0x%lx\n",
+            msg.addr, accessSize, msg.data);
+
+    gpuFrameWrite(msg.addr, accessSize, msg.data);
 }
 
 // ======================================================================
@@ -568,6 +721,39 @@ MI300XGem5Cosim::gpuFrameWrite(uint64_t offset, uint32_t size, uint64_t data)
     pkt->dataStatic(reinterpret_cast<uint8_t *>(&pkt_data));
 
     gpuDevice->writeFrame(pkt, offset);
+    delete pkt;
+}
+
+uint64_t
+MI300XGem5Cosim::gpuConfigRead(uint64_t offset, uint32_t size)
+{
+    fatal_if(!gpuDevice, "MI300XGem5Cosim: gpu_device not set");
+
+    uint64_t pkt_data = 0;
+    RequestPtr req = std::make_shared<Request>(
+        offset, size, 0, gpuDevice->vramRequestorId());
+    PacketPtr pkt = Packet::createRead(req);
+    pkt->dataStatic(reinterpret_cast<uint8_t *>(&pkt_data));
+
+    gpuDevice->readConfig(pkt);
+
+    uint64_t value = pkt->getUintX(ByteOrder::little);
+    delete pkt;
+    return value;
+}
+
+void
+MI300XGem5Cosim::gpuConfigWrite(uint64_t offset, uint32_t size, uint64_t data)
+{
+    fatal_if(!gpuDevice, "MI300XGem5Cosim: gpu_device not set");
+
+    uint64_t pkt_data = htole(data);
+    RequestPtr req = std::make_shared<Request>(
+        offset, size, 0, gpuDevice->vramRequestorId());
+    PacketPtr pkt = Packet::createWrite(req);
+    pkt->dataStatic(reinterpret_cast<uint8_t *>(&pkt_data));
+
+    gpuDevice->writeConfig(pkt);
     delete pkt;
 }
 
