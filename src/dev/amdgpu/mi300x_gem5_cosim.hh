@@ -52,48 +52,51 @@ class AMDGPUDevice;
 
 /**
  * Protocol message types matching the QEMU mi300x-gem5 PCIe device.
- * These must be kept in sync with the QEMU-side definitions.
+ * These values MUST be kept in sync with QEMU's MI300XGem5MsgType
+ * in include/hw/misc/mi300x_gem5.h.
  */
 enum class CosimMsgType : uint32_t
 {
-    MmioRead       = 0x0001,
-    MmioWrite      = 0x0002,
-    MmioReadResp   = 0x0003,
-    MmioWriteResp  = 0x0004,
-    DmaRead        = 0x0005,
-    DmaWrite       = 0x0006,
-    DmaReadResp    = 0x0007,
-    DmaWriteResp   = 0x0008,
-    Interrupt      = 0x0009,
-    InterruptResp  = 0x000a,
-    SyncReq        = 0x000b,
-    SyncResp       = 0x000c,
-    Hello          = 0x00ff,
-    HelloResp      = 0x0100,
+    /* QEMU -> gem5 */
+    MmioRead       = 0x01,
+    MmioWrite      = 0x02,
+    DoorbellRead   = 0x03,
+    DoorbellWrite  = 0x04,
+    DmaReq         = 0x05,
+    Init           = 0x06,
+    Shutdown       = 0x07,
+
+    /* gem5 -> QEMU */
+    MmioResp       = 0x81,
+    IrqRaise       = 0x82,
+    IrqLower       = 0x83,
+    DmaRead        = 0x84,
+    DmaWrite       = 0x85,
+    InitResp       = 0x86,
 };
 
 /**
- * Protocol message header for QEMU <-> gem5 co-simulation.
- * Must match the MI300XGem5MsgHeader in QEMU's mi300x_gem5.h.
+ * Wire-format message header for QEMU <-> gem5 co-simulation.
+ * Must match MI300XGem5MsgHeader in QEMU's mi300x_gem5.h exactly.
  *
- * All fields are in little-endian (native x86) byte order since
- * communication is via Unix domain socket on the same host.
+ * All fields are little-endian (native x86 byte order on same host).
+ * Total size: 32 bytes.
  */
 struct CosimMsgHeader
 {
-    uint32_t magic;       // 0x47454D35 ("GEM5")
-    uint32_t version;     // Protocol version (1)
-    uint32_t msg_type;    // CosimMsgType
-    uint32_t msg_id;      // Sequence number for request/response matching
-    uint32_t bar;         // BAR number (0, 2, 4)
-    uint64_t addr;        // Address/offset within the BAR
-    uint32_t size;        // Data size in bytes
-    uint32_t status;      // 0 = success, non-zero = error
-    uint8_t  data[256];   // Inline data for small transfers
+    uint32_t type;          /* CosimMsgType */
+    uint32_t size;          /* payload size in bytes (after header) */
+    uint64_t addr;          /* address for MMIO/DMA operations */
+    uint64_t data;          /* data value or DMA length */
+    uint32_t access_size;   /* 1/2/4/8 byte access width */
+    uint32_t id;            /* transaction ID for request/response matching */
 } __attribute__((packed));
 
-static constexpr uint32_t COSIM_MAGIC   = 0x47454D35; // "GEM5"
-static constexpr uint32_t COSIM_VERSION = 1;
+static_assert(sizeof(CosimMsgHeader) == 32,
+              "CosimMsgHeader must be 32 bytes to match QEMU");
+
+static constexpr size_t COSIM_MSG_HDR_SIZE = sizeof(CosimMsgHeader);
+static constexpr size_t COSIM_DMA_BUF_SIZE = 4 * 1024 * 1024; /* 4MB */
 
 /**
  * BAR numbers matching the QEMU device layout:
@@ -163,20 +166,19 @@ class MI300XGem5Cosim : public SimObject
     void processMessage(int fd, const CosimMsgHeader &msg);
     void handleMmioRead(int fd, const CosimMsgHeader &msg);
     void handleMmioWrite(int fd, const CosimMsgHeader &msg);
-    void handleHello(int fd, const CosimMsgHeader &msg);
-    void handleSync(int fd, const CosimMsgHeader &msg);
+    void handleDoorbellRead(int fd, const CosimMsgHeader &msg);
+    void handleDoorbellWrite(int fd, const CosimMsgHeader &msg);
+    void handleInit(int fd, const CosimMsgHeader &msg);
+    void handleShutdown(int fd, const CosimMsgHeader &msg);
 
     // -- I/O helpers --
 
     bool sendAll(int fd, const void *buf, size_t len);
     bool recvAll(int fd, void *buf, size_t len);
-    void sendResponse(int fd, CosimMsgHeader &resp);
+    void sendMsg(int fd, const CosimMsgHeader &msg);
 
     // -- MMIO forwarding --
 
-    uint64_t forwardMmioRead(uint32_t bar, uint64_t addr, uint32_t size);
-    void forwardMmioWrite(uint32_t bar, uint64_t addr, uint32_t size,
-                          uint64_t data);
     uint64_t readFromGpuDevice(uint64_t offset, uint32_t size, int gem5Bar);
     void writeToGpuDevice(uint64_t offset, uint32_t size, uint64_t data,
                           int gem5Bar);
@@ -188,9 +190,10 @@ class MI300XGem5Cosim : public SimObject
 
     // -- DMA and interrupt (gem5 -> QEMU) --
   public:
-    bool sendDmaRead(uint64_t addr, uint32_t size, const uint8_t *data);
-    bool sendDmaWrite(uint64_t addr, uint32_t size, const uint8_t *data);
-    bool sendInterrupt(uint32_t vector);
+    bool sendDmaRead(uint64_t addr, uint64_t len);
+    bool sendDmaWrite(uint64_t addr, uint64_t len, const uint8_t *data);
+    bool sendIrqRaise(uint32_t vector);
+    bool sendIrqLower(uint32_t vector);
 
   private:
     AMDGPUDevice *gpuDevice;
@@ -208,6 +211,9 @@ class MI300XGem5Cosim : public SimObject
     // Shared memory for VRAM
     void *shmemPtr = MAP_FAILED;
     int shmemFd = -1;
+
+    // DMA staging buffer
+    uint8_t *dmaBuf = nullptr;
 
     bool connected = false;
 };

@@ -46,9 +46,6 @@
 #include "base/trace.hh"
 #include "debug/MI300XCosim.hh"
 #include "dev/amdgpu/amdgpu_device.hh"
-#include "mem/packet.hh"
-#include "mem/packet_access.hh"
-#include "mem/request.hh"
 #include "sim/byteswap.hh"
 
 namespace gem5
@@ -61,6 +58,7 @@ MI300XGem5Cosim::MI300XGem5Cosim(const Params &p)
       shmemPath(p.shmem_path),
       vramSize(p.vram_size)
 {
+    dmaBuf = new uint8_t[COSIM_DMA_BUF_SIZE];
 }
 
 MI300XGem5Cosim::~MI300XGem5Cosim()
@@ -71,24 +69,24 @@ MI300XGem5Cosim::~MI300XGem5Cosim()
         close(fd);
     }
     clientEvents.clear();
+
+    delete[] dmaBuf;
+    dmaBuf = nullptr;
 }
 
 void
 MI300XGem5Cosim::startup()
 {
-    // Build the listen socket for Unix domain communication
     if (socketPath.empty()) {
         warn("MI300XGem5Cosim: No socket path configured, "
              "co-simulation disabled.\n");
         return;
     }
 
-    // Create Unix domain socket manually since we need a specific path
     int listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     fatal_if(listen_fd < 0, "MI300XGem5Cosim: socket() failed: %s",
              strerror(errno));
 
-    // Remove any stale socket file
     unlink(socketPath.c_str());
 
     struct sockaddr_un addr;
@@ -109,7 +107,6 @@ MI300XGem5Cosim::startup()
 
     inform("MI300XGem5Cosim: listening on %s", socketPath);
 
-    // Setup shared memory for VRAM
     if (!shmemPath.empty()) {
         setupSharedMemory();
     }
@@ -250,7 +247,6 @@ MI300XGem5Cosim::recvAll(int fd, void *buf, size_t len)
     while (received < len) {
         ssize_t ret = ::recv(fd, ptr + received, len - received, 0);
         if (ret == 0) {
-            // Connection closed
             return false;
         }
         if (ret < 0) {
@@ -265,11 +261,9 @@ MI300XGem5Cosim::recvAll(int fd, void *buf, size_t len)
 }
 
 void
-MI300XGem5Cosim::sendResponse(int fd, CosimMsgHeader &resp)
+MI300XGem5Cosim::sendMsg(int fd, const CosimMsgHeader &msg)
 {
-    resp.magic = COSIM_MAGIC;
-    resp.version = COSIM_VERSION;
-    if (!sendAll(fd, &resp, sizeof(resp))) {
+    if (!sendAll(fd, &msg, COSIM_MSG_HDR_SIZE)) {
         closeClient(fd);
     }
 }
@@ -280,14 +274,7 @@ void
 MI300XGem5Cosim::handleClientData(int fd)
 {
     CosimMsgHeader msg;
-    if (!recvAll(fd, &msg, sizeof(msg))) {
-        closeClient(fd);
-        return;
-    }
-
-    if (msg.magic != COSIM_MAGIC) {
-        warn("MI300XCosim: bad magic 0x%x from fd=%d, expected 0x%x",
-             msg.magic, fd, COSIM_MAGIC);
+    if (!recvAll(fd, &msg, COSIM_MSG_HDR_SIZE)) {
         closeClient(fd);
         return;
     }
@@ -300,11 +287,13 @@ MI300XGem5Cosim::handleClientData(int fd)
 void
 MI300XGem5Cosim::processMessage(int fd, const CosimMsgHeader &msg)
 {
-    CosimMsgType type = static_cast<CosimMsgType>(msg.msg_type);
+    CosimMsgType type = static_cast<CosimMsgType>(msg.type);
 
     DPRINTF(MI300XCosim,
-            "Received msg type=%u id=%u bar=%u addr=0x%lx size=%u\n",
-            msg.msg_type, msg.msg_id, msg.bar, msg.addr, msg.size);
+            "Received msg type=0x%x id=%u addr=0x%lx data=0x%lx "
+            "access_size=%u size=%u\n",
+            msg.type, msg.id, msg.addr, msg.data,
+            msg.access_size, msg.size);
 
     switch (type) {
       case CosimMsgType::MmioRead:
@@ -313,193 +302,139 @@ MI300XGem5Cosim::processMessage(int fd, const CosimMsgHeader &msg)
       case CosimMsgType::MmioWrite:
         handleMmioWrite(fd, msg);
         break;
-      case CosimMsgType::Hello:
-        handleHello(fd, msg);
+      case CosimMsgType::DoorbellRead:
+        handleDoorbellRead(fd, msg);
         break;
-      case CosimMsgType::SyncReq:
-        handleSync(fd, msg);
+      case CosimMsgType::DoorbellWrite:
+        handleDoorbellWrite(fd, msg);
+        break;
+      case CosimMsgType::Init:
+        handleInit(fd, msg);
+        break;
+      case CosimMsgType::Shutdown:
+        handleShutdown(fd, msg);
         break;
       default:
-        warn("MI300XCosim: unknown message type 0x%x", msg.msg_type);
+        warn("MI300XCosim: unknown message type 0x%x", msg.type);
         break;
     }
 }
 
 void
-MI300XGem5Cosim::handleHello(int fd, const CosimMsgHeader &msg)
+MI300XGem5Cosim::handleInit(int fd, const CosimMsgHeader &msg)
 {
-    inform("MI300XGem5Cosim: HELLO from QEMU (version %u)", msg.version);
+    uint64_t qemuVramSize = msg.data;
+    inform("MI300XGem5Cosim: INIT from QEMU (vram_size=%" PRIu64 " bytes)",
+           qemuVramSize);
 
     CosimMsgHeader resp{};
-    resp.msg_type = static_cast<uint32_t>(CosimMsgType::HelloResp);
-    resp.msg_id = msg.msg_id;
-    resp.version = COSIM_VERSION;
-    resp.status = 0;
-
-    // Encode VRAM size in the response data field
-    if (sizeof(uint64_t) <= sizeof(resp.data)) {
-        uint64_t vram = vramSize;
-        memcpy(resp.data, &vram, sizeof(vram));
-        resp.size = sizeof(vram);
-    }
-
-    sendResponse(fd, resp);
+    resp.type = static_cast<uint32_t>(CosimMsgType::InitResp);
+    resp.id = msg.id;
+    resp.data = vramSize;
+    resp.size = 0;
+    sendMsg(fd, resp);
 }
 
 void
-MI300XGem5Cosim::handleSync(int fd, const CosimMsgHeader &msg)
+MI300XGem5Cosim::handleShutdown(int fd, const CosimMsgHeader &msg)
 {
-    DPRINTF(MI300XCosim, "Sync request id=%u\n", msg.msg_id);
-
-    CosimMsgHeader resp{};
-    resp.msg_type = static_cast<uint32_t>(CosimMsgType::SyncResp);
-    resp.msg_id = msg.msg_id;
-    resp.status = 0;
-    sendResponse(fd, resp);
+    inform("MI300XGem5Cosim: SHUTDOWN from QEMU");
+    closeClient(fd);
 }
 
 void
 MI300XGem5Cosim::handleMmioRead(int fd, const CosimMsgHeader &msg)
 {
-    uint32_t size = msg.size;
-    if (size > sizeof(CosimMsgHeader::data)) {
-        warn("MI300XCosim: MMIO read size %u too large", size);
-        size = sizeof(CosimMsgHeader::data);
-    }
+    uint32_t accessSize = msg.access_size;
+    if (accessSize == 0 || accessSize > 8)
+        accessSize = 4;
 
-    uint64_t value = forwardMmioRead(msg.bar, msg.addr, size);
+    uint64_t value = readFromGpuDevice(msg.addr, accessSize, MMIO_BAR);
 
     DPRINTF(MI300XCosim,
-            "MMIO Read: bar=%u addr=0x%lx size=%u -> value=0x%lx\n",
-            msg.bar, msg.addr, size, value);
+            "MMIO Read: addr=0x%lx access_size=%u -> value=0x%lx\n",
+            msg.addr, accessSize, value);
 
     CosimMsgHeader resp{};
-    resp.msg_type = static_cast<uint32_t>(CosimMsgType::MmioReadResp);
-    resp.msg_id = msg.msg_id;
-    resp.bar = msg.bar;
+    resp.type = static_cast<uint32_t>(CosimMsgType::MmioResp);
+    resp.id = msg.id;
     resp.addr = msg.addr;
-    resp.size = size;
-    resp.status = 0;
-    memcpy(resp.data, &value, size);
-    sendResponse(fd, resp);
+    resp.data = value;
+    resp.access_size = accessSize;
+    resp.size = 0;
+    sendMsg(fd, resp);
 }
 
 void
 MI300XGem5Cosim::handleMmioWrite(int fd, const CosimMsgHeader &msg)
 {
-    uint32_t size = msg.size;
-    if (size > sizeof(CosimMsgHeader::data)) {
-        warn("MI300XCosim: MMIO write size %u too large", size);
-        size = sizeof(CosimMsgHeader::data);
-    }
-
-    uint64_t value = 0;
-    memcpy(&value, msg.data, size);
+    uint32_t accessSize = msg.access_size;
+    if (accessSize == 0 || accessSize > 8)
+        accessSize = 4;
 
     DPRINTF(MI300XCosim,
-            "MMIO Write: bar=%u addr=0x%lx size=%u value=0x%lx\n",
-            msg.bar, msg.addr, size, value);
+            "MMIO Write: addr=0x%lx access_size=%u value=0x%lx\n",
+            msg.addr, accessSize, msg.data);
 
-    forwardMmioWrite(msg.bar, msg.addr, size, value);
+    writeToGpuDevice(msg.addr, accessSize, msg.data, MMIO_BAR);
+
+    // MMIO writes are fire-and-forget from QEMU's perspective
+    // (QEMU's mi300x_send_msg passes NULL response for writes)
+}
+
+void
+MI300XGem5Cosim::handleDoorbellRead(int fd, const CosimMsgHeader &msg)
+{
+    uint32_t accessSize = msg.access_size;
+    if (accessSize == 0 || accessSize > 8)
+        accessSize = 4;
+
+    uint64_t value = readFromGpuDevice(msg.addr, accessSize, DOORBELL_BAR);
+
+    DPRINTF(MI300XCosim,
+            "Doorbell Read: addr=0x%lx access_size=%u -> value=0x%lx\n",
+            msg.addr, accessSize, value);
 
     CosimMsgHeader resp{};
-    resp.msg_type = static_cast<uint32_t>(CosimMsgType::MmioWriteResp);
-    resp.msg_id = msg.msg_id;
-    resp.bar = msg.bar;
+    resp.type = static_cast<uint32_t>(CosimMsgType::MmioResp);
+    resp.id = msg.id;
     resp.addr = msg.addr;
-    resp.size = size;
-    resp.status = 0;
-    sendResponse(fd, resp);
+    resp.data = value;
+    resp.access_size = accessSize;
+    resp.size = 0;
+    sendMsg(fd, resp);
+}
+
+void
+MI300XGem5Cosim::handleDoorbellWrite(int fd, const CosimMsgHeader &msg)
+{
+    uint32_t accessSize = msg.access_size;
+    if (accessSize == 0 || accessSize > 8)
+        accessSize = 4;
+
+    DPRINTF(MI300XCosim,
+            "Doorbell Write: addr=0x%lx access_size=%u value=0x%lx\n",
+            msg.addr, accessSize, msg.data);
+
+    writeToGpuDevice(msg.addr, accessSize, msg.data, DOORBELL_BAR);
+
+    // Doorbell writes are fire-and-forget (QEMU sends NULL response)
 }
 
 // ---- MMIO Forwarding to AMDGPUDevice ----
 
 uint64_t
-MI300XGem5Cosim::forwardMmioRead(uint32_t bar, uint64_t addr, uint32_t size)
-{
-    fatal_if(!gpuDevice, "MI300XGem5Cosim: gpu_device not set");
-
-    // Map QEMU BAR numbers to gem5 BAR numbers:
-    //   QEMU BAR0 (MMIO regs)   -> gem5 BAR5 (MMIO_BAR)
-    //   QEMU BAR2 (VRAM)        -> gem5 BAR0 (FRAMEBUFFER_BAR)
-    //   QEMU BAR4 (Doorbell)    -> gem5 BAR2 (DOORBELL_BAR)
-    //
-    // For VRAM reads via shared memory, we can read directly from shmem.
-    if (bar == COSIM_BAR_VRAM) {
-        // VRAM access: use shared memory if available
-        if (shmemPtr != MAP_FAILED && addr + size <= vramSize) {
-            uint64_t value = 0;
-            memcpy(&value, static_cast<uint8_t *>(shmemPtr) + addr, size);
-            return value;
-        }
-        // Fallback: forward as framebuffer read to GPU device
-        return readFromGpuDevice(addr, size, FRAMEBUFFER_BAR);
-    }
-
-    // For MMIO and Doorbell: create a gem5 packet and forward to GPU device
-    int gem5Bar;
-    if (bar == COSIM_BAR_MMIO) {
-        gem5Bar = MMIO_BAR;
-    } else if (bar == COSIM_BAR_DOORBELL) {
-        gem5Bar = DOORBELL_BAR;
-    } else {
-        warn("MI300XCosim: unknown BAR %u for read", bar);
-        return 0;
-    }
-
-    return readFromGpuDevice(addr, size, gem5Bar);
-}
-
-void
-MI300XGem5Cosim::forwardMmioWrite(uint32_t bar, uint64_t addr, uint32_t size,
-                                  uint64_t data)
-{
-    fatal_if(!gpuDevice, "MI300XGem5Cosim: gpu_device not set");
-
-    if (bar == COSIM_BAR_VRAM) {
-        // VRAM write: use shared memory if available
-        if (shmemPtr != MAP_FAILED && addr + size <= vramSize) {
-            memcpy(static_cast<uint8_t *>(shmemPtr) + addr, &data, size);
-            return;
-        }
-        writeToGpuDevice(addr, size, data, FRAMEBUFFER_BAR);
-        return;
-    }
-
-    int gem5Bar;
-    if (bar == COSIM_BAR_MMIO) {
-        gem5Bar = MMIO_BAR;
-    } else if (bar == COSIM_BAR_DOORBELL) {
-        gem5Bar = DOORBELL_BAR;
-    } else {
-        warn("MI300XCosim: unknown BAR %u for write", bar);
-        return;
-    }
-
-    writeToGpuDevice(addr, size, data, gem5Bar);
-}
-
-uint64_t
 MI300XGem5Cosim::readFromGpuDevice(uint64_t offset, uint32_t size,
                                    int gem5Bar)
 {
-    // Use the AMDGPUDevice's register read interface for MMIO BAR.
-    // For other BARs we need to construct packets, but the existing
-    // getRegVal/setRegVal only handle 32-bit MMIO reads.
-    //
-    // For MMIO reads, we can use getRegVal which handles the full
-    // MMIO dispatch path.
-    if (gem5Bar == MMIO_BAR && size == sizeof(uint32_t)) {
-        return gpuDevice->getRegVal(offset);
-    }
+    fatal_if(!gpuDevice, "MI300XGem5Cosim: gpu_device not set");
 
-    // For non-standard sizes or other BARs, construct a packet.
-    // The BAR base address must be added to get the full PCI address,
-    // but since we're calling readMMIO/readDoorbell/readFrame directly
-    // through getRegVal/setRegVal with offsets, we handle 32-bit MMIO
-    // specially and warn for others.
     if (gem5Bar == MMIO_BAR) {
-        // Handle different read sizes by composing 32-bit reads
+        if (size <= sizeof(uint32_t)) {
+            return gpuDevice->getRegVal(offset);
+        }
+
+        // Handle 8-byte reads by composing two 32-bit reads
         uint64_t value = 0;
         uint32_t remaining = size;
         uint64_t cur_addr = offset;
@@ -523,18 +458,15 @@ MI300XGem5Cosim::readFromGpuDevice(uint64_t offset, uint32_t size,
         return value;
     }
 
-    // For doorbell and framebuffer, use getRegVal as a best-effort approach.
-    // A full implementation would construct proper packets with BAR addresses.
+    // For doorbell and framebuffer BARs
     DPRINTF(MI300XCosim,
-            "Read from gem5 BAR %d offset 0x%lx size %u "
-            "(using register interface)\n",
+            "Read from gem5 BAR %d offset 0x%lx size %u\n",
             gem5Bar, offset, size);
 
     if (size <= sizeof(uint32_t)) {
         return gpuDevice->getRegVal(offset);
     }
 
-    // For larger reads, compose from 32-bit reads
     uint64_t value = 0;
     for (uint32_t i = 0; i < size; i += 4) {
         uint32_t partial = gpuDevice->getRegVal(offset + i);
@@ -548,13 +480,14 @@ void
 MI300XGem5Cosim::writeToGpuDevice(uint64_t offset, uint32_t size,
                                   uint64_t data, int gem5Bar)
 {
-    if (gem5Bar == MMIO_BAR && size == sizeof(uint32_t)) {
-        gpuDevice->setRegVal(offset, static_cast<uint32_t>(data));
-        return;
-    }
+    fatal_if(!gpuDevice, "MI300XGem5Cosim: gpu_device not set");
 
     if (gem5Bar == MMIO_BAR) {
-        // Handle different write sizes by decomposing into 32-bit writes
+        if (size <= sizeof(uint32_t)) {
+            gpuDevice->setRegVal(offset, static_cast<uint32_t>(data));
+            return;
+        }
+
         uint32_t remaining = size;
         uint64_t cur_addr = offset;
         uint32_t byte_offset = 0;
@@ -571,7 +504,6 @@ MI300XGem5Cosim::writeToGpuDevice(uint64_t offset, uint32_t size,
         }
 
         if (remaining > 0) {
-            // For sub-dword writes, read-modify-write
             uint32_t reg_val = gpuDevice->getRegVal(cur_addr);
             memcpy(&reg_val,
                    reinterpret_cast<const uint8_t *>(&data) + byte_offset,
@@ -582,8 +514,7 @@ MI300XGem5Cosim::writeToGpuDevice(uint64_t offset, uint32_t size,
     }
 
     DPRINTF(MI300XCosim,
-            "Write to gem5 BAR %d offset 0x%lx size %u value 0x%lx "
-            "(using register interface)\n",
+            "Write to gem5 BAR %d offset 0x%lx size %u value 0x%lx\n",
             gem5Bar, offset, size, data);
 
     if (size <= sizeof(uint32_t)) {
@@ -603,76 +534,100 @@ MI300XGem5Cosim::writeToGpuDevice(uint64_t offset, uint32_t size,
 // ---- DMA and Interrupt (gem5 -> QEMU) ----
 
 bool
-MI300XGem5Cosim::sendDmaRead(uint64_t addr, uint32_t size,
-                             const uint8_t *data)
+MI300XGem5Cosim::sendDmaRead(uint64_t addr, uint64_t len)
 {
     if (primaryClientFd < 0)
         return false;
 
     CosimMsgHeader msg{};
-    msg.msg_type = static_cast<uint32_t>(CosimMsgType::DmaRead);
-    msg.msg_id = nextMsgId++;
+    msg.type = static_cast<uint32_t>(CosimMsgType::DmaRead);
+    msg.id = nextMsgId++;
     msg.addr = addr;
-    msg.size = std::min(size, (uint32_t)sizeof(msg.data));
-    if (data) {
-        memcpy(msg.data, data, msg.size);
-    }
-    sendResponse(primaryClientFd, msg);
+    msg.data = len;
+    msg.size = 0;
 
-    // Wait for response
-    CosimMsgHeader resp;
-    if (!recvAll(primaryClientFd, &resp, sizeof(resp))) {
+    if (!sendAll(primaryClientFd, &msg, COSIM_MSG_HDR_SIZE)) {
         return false;
     }
 
-    return resp.status == 0;
+    // The QEMU event thread will read guest memory and send back
+    // a MmioResp with the payload following the header
+    CosimMsgHeader resp;
+    if (!recvAll(primaryClientFd, &resp, COSIM_MSG_HDR_SIZE)) {
+        return false;
+    }
+
+    // Read payload data if present
+    uint32_t payloadSize = resp.size;
+    if (payloadSize > 0 && payloadSize <= COSIM_DMA_BUF_SIZE) {
+        if (!recvAll(primaryClientFd, dmaBuf, payloadSize)) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 bool
-MI300XGem5Cosim::sendDmaWrite(uint64_t addr, uint32_t size,
+MI300XGem5Cosim::sendDmaWrite(uint64_t addr, uint64_t len,
                               const uint8_t *data)
 {
     if (primaryClientFd < 0)
         return false;
 
-    CosimMsgHeader msg{};
-    msg.msg_type = static_cast<uint32_t>(CosimMsgType::DmaWrite);
-    msg.msg_id = nextMsgId++;
-    msg.addr = addr;
-    msg.size = std::min(size, (uint32_t)sizeof(msg.data));
-    if (data) {
-        memcpy(msg.data, data, msg.size);
-    }
-    sendResponse(primaryClientFd, msg);
-
-    CosimMsgHeader resp;
-    if (!recvAll(primaryClientFd, &resp, sizeof(resp))) {
+    if (len > COSIM_DMA_BUF_SIZE) {
+        warn("MI300XCosim: DMA write too large: %" PRIu64, len);
         return false;
     }
 
-    return resp.status == 0;
+    CosimMsgHeader msg{};
+    msg.type = static_cast<uint32_t>(CosimMsgType::DmaWrite);
+    msg.id = nextMsgId++;
+    msg.addr = addr;
+    msg.data = len;
+    msg.size = len;
+
+    // Send header followed by payload
+    if (!sendAll(primaryClientFd, &msg, COSIM_MSG_HDR_SIZE)) {
+        return false;
+    }
+    if (data && len > 0) {
+        if (!sendAll(primaryClientFd, data, len)) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 bool
-MI300XGem5Cosim::sendInterrupt(uint32_t vector)
+MI300XGem5Cosim::sendIrqRaise(uint32_t vector)
 {
     if (primaryClientFd < 0)
         return false;
 
     CosimMsgHeader msg{};
-    msg.msg_type = static_cast<uint32_t>(CosimMsgType::Interrupt);
-    msg.msg_id = nextMsgId++;
-    msg.addr = vector;
+    msg.type = static_cast<uint32_t>(CosimMsgType::IrqRaise);
+    msg.id = nextMsgId++;
+    msg.data = vector;
     msg.size = 0;
-    msg.status = 0;
-    sendResponse(primaryClientFd, msg);
 
-    CosimMsgHeader resp;
-    if (!recvAll(primaryClientFd, &resp, sizeof(resp))) {
+    return sendAll(primaryClientFd, &msg, COSIM_MSG_HDR_SIZE);
+}
+
+bool
+MI300XGem5Cosim::sendIrqLower(uint32_t vector)
+{
+    if (primaryClientFd < 0)
         return false;
-    }
 
-    return resp.status == 0;
+    CosimMsgHeader msg{};
+    msg.type = static_cast<uint32_t>(CosimMsgType::IrqLower);
+    msg.id = nextMsgId++;
+    msg.data = vector;
+    msg.size = 0;
+
+    return sendAll(primaryClientFd, &msg, COSIM_MSG_HDR_SIZE);
 }
 
 } // namespace gem5
