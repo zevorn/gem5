@@ -1,4 +1,4 @@
-# Copyright (c) 2021 Advanced Micro Devices, Inc.
+# Copyright (c) 2024 The gem5 Contributors
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -27,41 +27,38 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-Import('*')
+from m5.objects.AMDGPU import AMDGPUDevice
+from m5.params import *
+from m5.SimObject import SimObject
 
-if not env['CONF']['BUILD_GPU']:
-    Return()
 
-if not env['CONF']['USE_X86_ISA']:
-    Return()
+class MI300XGem5Cosim(SimObject):
+    """Socket server bridging QEMU mi300x-gem5 PCIe device to gem5 AMDGPUDevice.
 
-# Controllers
-SimObject('AMDGPU.py', sim_objects=['AMDGPUDevice', 'AMDGPUInterruptHandler',
-                                    'AMDGPUMemoryManager', 'AMDGPUSystemHub',
-                                    'SDMAEngine', 'PM4PacketProcessor'],
-                                    tags=['x86 isa'])
+    This SimObject listens on a Unix domain socket for MMIO requests from
+    QEMU's mi300x-gem5 PCIe endpoint device. It forwards those requests to
+    the gem5 AMDGPUDevice (MI300X model) and returns the results.
 
-Source('amdgpu_device.cc', tags=['x86 isa'])
-Source('amdgpu_gfx.cc', tags=['x86 isa'])
-Source('amdgpu_nbio.cc', tags=['x86 isa'])
-Source('amdgpu_smu.cc', tags=['x86 isa'])
-Source('amdgpu_vm.cc', tags=['x86 isa'])
-Source('interrupt_handler.cc', tags=['x86 isa'])
-Source('memory_manager.cc', tags=['x86 isa'])
-Source('mmio_reader.cc', tags=['x86 isa'])
-Source('pm4_packet_processor.cc', tags=['x86 isa'])
-Source('sdma_engine.cc', tags=['x86 isa'])
-Source('system_hub.cc', tags=['x86 isa'])
+    VRAM is shared via mmap'd /dev/shm for zero-copy access between QEMU
+    and gem5.
+    """
 
-# MI300X co-simulation with QEMU
-SimObject('MI300XGem5Cosim.py', sim_objects=['MI300XGem5Cosim'],
-                                tags=['x86 isa'])
-Source('mi300x_gem5_cosim.cc', tags=['x86 isa'])
+    type = "MI300XGem5Cosim"
+    cxx_header = "dev/amdgpu/mi300x_gem5_cosim.hh"
+    cxx_class = "gem5::MI300XGem5Cosim"
 
-DebugFlag('AMDGPUDevice', tags=['x86 isa'])
-DebugFlag('AMDGPUMem', tags=['x86 isa'])
-DebugFlag('AMDGPUSystemHub', tags=['x86 isa'])
-DebugFlag('PM4PacketProcessor', tags=['x86 isa'])
-DebugFlag('SDMAEngine', tags=['x86 isa'])
-DebugFlag('SDMAData', tags=['x86 isa'])
-DebugFlag('MI300XCosim', tags=['x86 isa'])
+    gpu_device = Param.AMDGPUDevice("The AMDGPUDevice to forward MMIO to")
+
+    socket_path = Param.String(
+        "/tmp/gem5-mi300x.sock",
+        "Unix domain socket path for QEMU connection",
+    )
+
+    shmem_path = Param.String(
+        "/mi300x-vram",
+        "POSIX shared memory name for VRAM (e.g. /mi300x-vram)",
+    )
+
+    vram_size = Param.MemorySize(
+        "16GiB", "Size of VRAM shared memory region"
+    )
