@@ -52,6 +52,7 @@ namespace gem5
 
 class AMDGPUInterruptHandler;
 class SDMAEngine;
+class MI300XGem5Cosim;
 class System;
 
 /**
@@ -64,6 +65,10 @@ class System;
  */
 class AMDGPUDevice : public PciEndpoint
 {
+    // Allow co-simulation bridge to call readDoorbell/writeDoorbell/
+    // readFrame/writeFrame directly for proper BAR-level forwarding.
+    friend class MI300XGem5Cosim;
+
   private:
     /**
      * Convert a PCI packet into a response

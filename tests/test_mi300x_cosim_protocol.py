@@ -490,6 +490,300 @@ class TestSocketProtocol(unittest.TestCase):
 # Test: Source code cross-validation
 # ======================================================================
 
+class TestTwoSocketArchitecture(unittest.TestCase):
+    """Test the two-connection architecture (MMIO + Event sockets)."""
+
+    def setUp(self):
+        self.sock_path = tempfile.mktemp(suffix='.sock', prefix='cosim_2sock_')
+        self.server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.server_sock.bind(self.sock_path)
+        self.server_sock.listen(2)  # Accept two connections
+
+    def tearDown(self):
+        self.server_sock.close()
+        if os.path.exists(self.sock_path):
+            os.unlink(self.sock_path)
+
+    def test_two_connections_init_then_event(self):
+        """Verify QEMU connects twice: first MMIO, then event."""
+        connections = []
+
+        def server_accept_two():
+            """Accept two connections from 'QEMU'."""
+            for _ in range(2):
+                conn, _ = self.server_sock.accept()
+                connections.append(conn)
+
+        server_thread = threading.Thread(target=server_accept_two)
+        server_thread.daemon = True
+        server_thread.start()
+
+        # QEMU first connection: MMIO
+        mmio_client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        mmio_client.connect(self.sock_path)
+
+        # Send INIT on MMIO socket
+        init_msg = pack_msg(msg_type=MI300X_MSG_INIT, msg_id=1,
+                           data=16 * 1024**3)
+        mmio_client.sendall(init_msg)
+
+        time.sleep(0.1)
+
+        # Server reads INIT from first connection
+        self.assertEqual(len(connections), 1)
+        data = connections[0].recv(MSG_HDR_SIZE)
+        msg = unpack_msg(data)
+        self.assertEqual(msg['type'], MI300X_MSG_INIT)
+
+        # Server sends INIT_RESP
+        resp = pack_msg(msg_type=MI300X_MSG_INIT_RESP, msg_id=1,
+                       data=16 * 1024**3)
+        connections[0].sendall(resp)
+
+        # Read INIT_RESP on MMIO socket
+        resp_data = mmio_client.recv(MSG_HDR_SIZE)
+        resp = unpack_msg(resp_data)
+        self.assertEqual(resp['type'], MI300X_MSG_INIT_RESP)
+
+        # QEMU second connection: Events
+        event_client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        event_client.connect(self.sock_path)
+
+        time.sleep(0.1)
+        self.assertEqual(len(connections), 2)
+
+        # Now MMIO and events use separate connections
+        # MMIO: connections[0] <-> mmio_client
+        # Events: connections[1] <-> event_client
+
+        # Server sends IRQ on event connection (not MMIO)
+        irq_msg = pack_msg(msg_type=MI300X_MSG_IRQ_RAISE, data=5)
+        connections[1].sendall(irq_msg)
+
+        # Event client receives IRQ (not MMIO client)
+        irq_data = event_client.recv(MSG_HDR_SIZE)
+        irq = unpack_msg(irq_data)
+        self.assertEqual(irq['type'], MI300X_MSG_IRQ_RAISE)
+        self.assertEqual(irq['data'] & 0xFFFF, 5)
+
+        # Simultaneously, MMIO still works independently
+        mmio_read = pack_msg(msg_type=MI300X_MSG_MMIO_READ, msg_id=2,
+                            addr=0xD000, access_size=4)
+        mmio_client.sendall(mmio_read)
+
+        mmio_data = connections[0].recv(MSG_HDR_SIZE)
+        mmio_msg = unpack_msg(mmio_data)
+        self.assertEqual(mmio_msg['type'], MI300X_MSG_MMIO_READ)
+
+        mmio_resp = pack_msg(msg_type=MI300X_MSG_MMIO_RESP, msg_id=2,
+                            addr=0xD000, data=0, access_size=4)
+        connections[0].sendall(mmio_resp)
+
+        mmio_resp_data = mmio_client.recv(MSG_HDR_SIZE)
+        self.assertEqual(len(mmio_resp_data), MSG_HDR_SIZE)
+
+        mmio_client.close()
+        event_client.close()
+        for c in connections:
+            c.close()
+        server_thread.join(timeout=2)
+
+    def test_mmio_and_event_no_interference(self):
+        """Verify event messages don't interfere with MMIO responses."""
+        connections = []
+
+        def server_handler():
+            for _ in range(2):
+                conn, _ = self.server_sock.accept()
+                connections.append(conn)
+
+        t = threading.Thread(target=server_handler)
+        t.daemon = True
+        t.start()
+
+        mmio_client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        mmio_client.connect(self.sock_path)
+        event_client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        event_client.connect(self.sock_path)
+        time.sleep(0.1)
+
+        # Send 10 MMIO reads while gem5 sends IRQs on event connection
+        for i in range(10):
+            # gem5 sends IRQ on event connection
+            irq = pack_msg(msg_type=MI300X_MSG_IRQ_RAISE, data=i)
+            connections[1].sendall(irq)
+
+            # QEMU sends MMIO read on MMIO connection
+            read_msg = pack_msg(msg_type=MI300X_MSG_MMIO_READ, msg_id=i,
+                               addr=0x1000 + i * 4, access_size=4)
+            mmio_client.sendall(read_msg)
+
+            # gem5 responds to MMIO on MMIO connection
+            req_data = connections[0].recv(MSG_HDR_SIZE)
+            req = unpack_msg(req_data)
+            self.assertEqual(req['type'], MI300X_MSG_MMIO_READ)
+
+            resp = pack_msg(msg_type=MI300X_MSG_MMIO_RESP, msg_id=i,
+                           data=0xAA00 + i)
+            connections[0].sendall(resp)
+
+            # QEMU reads MMIO response (guaranteed on MMIO socket, not event)
+            resp_data = mmio_client.recv(MSG_HDR_SIZE)
+            r = unpack_msg(resp_data)
+            self.assertEqual(r['type'], MI300X_MSG_MMIO_RESP)
+            self.assertEqual(r['data'], 0xAA00 + i)
+
+            # Event client reads IRQ (on event socket, not MMIO)
+            irq_data = event_client.recv(MSG_HDR_SIZE)
+            irq_msg = unpack_msg(irq_data)
+            self.assertEqual(irq_msg['type'], MI300X_MSG_IRQ_RAISE)
+            self.assertEqual(irq_msg['data'] & 0xFFFF, i)
+
+        mmio_client.close()
+        event_client.close()
+        for c in connections:
+            c.close()
+        t.join(timeout=2)
+
+
+class TestDriverInitSimulation(unittest.TestCase):
+    """Simulate the amdgpu driver init sequence over the protocol."""
+
+    def setUp(self):
+        self.sock_path = tempfile.mktemp(suffix='.sock', prefix='cosim_drv_')
+        self.server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.server_sock.bind(self.sock_path)
+        self.server_sock.listen(2)
+
+    def tearDown(self):
+        self.server_sock.close()
+        if os.path.exists(self.sock_path):
+            os.unlink(self.sock_path)
+
+    def test_driver_init_sequence(self):
+        """Simulate full amdgpu driver initialization MMIO sequence.
+
+        This mimics what the real amdgpu driver does during probe:
+        1. INIT handshake
+        2. Read GPU identification registers
+        3. Read framebuffer location registers
+        4. Read GRBM status
+        5. Write configuration registers
+        """
+        # MI300X register values (matching gem5's setRegVal in constructor)
+        MI300X_FB_LOCATION_BASE = 0x60920
+        MI300X_FB_LOCATION_TOP = 0x60924
+        MI300X_MEM_SIZE_REG = 0x60928
+        AMDGPU_MP0_SMN_C2PMSG_33 = 0x3B10C
+
+        mmhub_base = 0x8000 >> 24  # typically set by gem5
+        mmhub_top = (0x8000 + 0x4000) >> 24
+        mem_size = 16 * 1024  # 16 GB in MB
+
+        # Register map: offset -> value (what gem5 would return)
+        reg_map = {
+            AMDGPU_MP0_SMN_C2PMSG_33: 0x80000000,
+            MI300X_FB_LOCATION_BASE: mmhub_base,
+            MI300X_FB_LOCATION_TOP: mmhub_top,
+            MI300X_MEM_SIZE_REG: mem_size,
+            0xD000: 0x00000000,  # GRBM_STATUS (idle)
+            0xD004: 0x00000000,  # GRBM_STATUS2
+        }
+
+        def gem5_server():
+            """Mock gem5 server handling driver init MMIO."""
+            mmio_conn, _ = self.server_sock.accept()
+
+            # Handle INIT
+            data = mmio_conn.recv(MSG_HDR_SIZE)
+            msg = unpack_msg(data)
+            assert msg['type'] == MI300X_MSG_INIT
+            resp = pack_msg(msg_type=MI300X_MSG_INIT_RESP,
+                           msg_id=msg['id'], data=16 * 1024**3)
+            mmio_conn.sendall(resp)
+
+            # Handle MMIO reads/writes until shutdown
+            while True:
+                data = mmio_conn.recv(MSG_HDR_SIZE)
+                if not data:
+                    break
+                msg = unpack_msg(data)
+
+                if msg['type'] == MI300X_MSG_SHUTDOWN:
+                    break
+                elif msg['type'] == MI300X_MSG_MMIO_READ:
+                    addr = msg['addr']
+                    value = reg_map.get(addr, 0)
+                    resp = pack_msg(msg_type=MI300X_MSG_MMIO_RESP,
+                                   msg_id=msg['id'], addr=addr,
+                                   data=value, access_size=4)
+                    mmio_conn.sendall(resp)
+                elif msg['type'] == MI300X_MSG_MMIO_WRITE:
+                    # Accept writes silently (fire-and-forget)
+                    reg_map[msg['addr']] = msg['data']
+                elif msg['type'] == MI300X_MSG_DB_WRITE:
+                    # Doorbell writes are fire-and-forget
+                    pass
+
+            mmio_conn.close()
+
+        server_thread = threading.Thread(target=gem5_server)
+        server_thread.daemon = True
+        server_thread.start()
+
+        # QEMU side: connect and run driver init sequence
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.connect(self.sock_path)
+
+        # Step 1: INIT handshake
+        init_msg = pack_msg(msg_type=MI300X_MSG_INIT, msg_id=0,
+                           data=16 * 1024**3)
+        client.sendall(init_msg)
+        resp = unpack_msg(client.recv(MSG_HDR_SIZE))
+        self.assertEqual(resp['type'], MI300X_MSG_INIT_RESP)
+        self.assertEqual(resp['data'], 16 * 1024**3)
+
+        # Step 2: Read MP0 firmware status
+        client.sendall(pack_msg(msg_type=MI300X_MSG_MMIO_READ, msg_id=1,
+                               addr=AMDGPU_MP0_SMN_C2PMSG_33, access_size=4))
+        resp = unpack_msg(client.recv(MSG_HDR_SIZE))
+        self.assertEqual(resp['data'], 0x80000000)
+
+        # Step 3: Read FB location registers
+        for reg_addr, expected in [
+            (MI300X_FB_LOCATION_BASE, mmhub_base),
+            (MI300X_FB_LOCATION_TOP, mmhub_top),
+            (MI300X_MEM_SIZE_REG, mem_size),
+        ]:
+            client.sendall(pack_msg(msg_type=MI300X_MSG_MMIO_READ,
+                                   msg_id=2, addr=reg_addr, access_size=4))
+            resp = unpack_msg(client.recv(MSG_HDR_SIZE))
+            self.assertEqual(resp['data'], expected,
+                           f"Register 0x{reg_addr:x} expected {expected} "
+                           f"got {resp['data']}")
+
+        # Step 4: Read GRBM_STATUS
+        client.sendall(pack_msg(msg_type=MI300X_MSG_MMIO_READ, msg_id=3,
+                               addr=0xD000, access_size=4))
+        resp = unpack_msg(client.recv(MSG_HDR_SIZE))
+        self.assertEqual(resp['data'], 0)  # GPU idle
+
+        # Step 5: Write a config register (fire-and-forget)
+        client.sendall(pack_msg(msg_type=MI300X_MSG_MMIO_WRITE, msg_id=4,
+                               addr=0x1234, data=0xDEADBEEF, access_size=4))
+
+        # Step 6: Write a doorbell (fire-and-forget)
+        client.sendall(pack_msg(msg_type=MI300X_MSG_DB_WRITE, msg_id=5,
+                               addr=0x100, data=0x42, access_size=4))
+
+        # Step 7: Shutdown
+        client.sendall(pack_msg(msg_type=MI300X_MSG_SHUTDOWN, msg_id=99))
+
+        time.sleep(0.1)
+        client.close()
+        server_thread.join(timeout=2)
+
+
 class TestSourceCodeAlignment(unittest.TestCase):
     """Verify gem5 and QEMU source definitions are aligned."""
 

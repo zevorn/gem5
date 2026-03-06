@@ -99,18 +99,13 @@ static constexpr size_t COSIM_MSG_HDR_SIZE = sizeof(CosimMsgHeader);
 static constexpr size_t COSIM_DMA_BUF_SIZE = 4 * 1024 * 1024; /* 4MB */
 
 /**
- * BAR numbers matching the QEMU device layout:
- *   BAR0: MMIO registers (256 MB)
- *   BAR2: VRAM (shared memory, 16 GB)
- *   BAR4: Doorbell (8 MB)
- */
-static constexpr uint32_t COSIM_BAR_MMIO     = 0;
-static constexpr uint32_t COSIM_BAR_VRAM     = 2;
-static constexpr uint32_t COSIM_BAR_DOORBELL = 4;
-
-/**
  * MI300XGem5Cosim: Socket server that bridges QEMU's mi300x-gem5 PCIe
  * device to gem5's AMDGPUDevice for MI300X GPU simulation.
+ *
+ * QEMU BAR layout -> gem5 BAR mapping:
+ *   QEMU BAR0 (MMIO regs, 256MB)    -> gem5 BAR5 (MMIO_BAR)
+ *   QEMU BAR2 (VRAM, 16GB)          -> gem5 BAR0 (FRAMEBUFFER_BAR)
+ *   QEMU BAR4 (Doorbell, 8MB)       -> gem5 BAR2 (DOORBELL_BAR)
  *
  * Architecture:
  *   QEMU (guest + ROCm driver)
@@ -119,7 +114,8 @@ static constexpr uint32_t COSIM_BAR_DOORBELL = 4;
  *       v
  *   MI300XGem5Cosim (this class, in gem5)
  *       |
- *       | forward MMIO / doorbell / framebuffer
+ *       | forward via readMMIO/writeMMIO, readDoorbell/writeDoorbell,
+ *       | readFrame/writeFrame using proper PacketPtr
  *       v
  *   AMDGPUDevice (existing gem5 MI300X model)
  *
@@ -177,11 +173,14 @@ class MI300XGem5Cosim : public SimObject
     bool recvAll(int fd, void *buf, size_t len);
     void sendMsg(int fd, const CosimMsgHeader &msg);
 
-    // -- MMIO forwarding --
+    // -- GPU device forwarding using proper PacketPtr --
 
-    uint64_t readFromGpuDevice(uint64_t offset, uint32_t size, int gem5Bar);
-    void writeToGpuDevice(uint64_t offset, uint32_t size, uint64_t data,
-                          int gem5Bar);
+    uint64_t gpuMmioRead(uint64_t offset, uint32_t size);
+    void gpuMmioWrite(uint64_t offset, uint32_t size, uint64_t data);
+    uint64_t gpuDoorbellRead(uint64_t offset, uint32_t size);
+    void gpuDoorbellWrite(uint64_t offset, uint32_t size, uint64_t data);
+    uint64_t gpuFrameRead(uint64_t offset, uint32_t size);
+    void gpuFrameWrite(uint64_t offset, uint32_t size, uint64_t data);
 
     // -- Shared memory (VRAM) --
 
@@ -205,7 +204,8 @@ class MI300XGem5Cosim : public SimObject
     std::unique_ptr<ListenEvent> listenEvent;
     std::unordered_map<int, std::unique_ptr<ClientEvent>> clientEvents;
 
-    int primaryClientFd = -1;
+    int mmioClientFd = -1;      // First connection: synchronous MMIO
+    int eventClientFd = -1;     // Second connection: async events
     uint32_t nextMsgId = 1;
 
     // Shared memory for VRAM

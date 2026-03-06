@@ -46,6 +46,9 @@
 #include "base/trace.hh"
 #include "debug/MI300XCosim.hh"
 #include "dev/amdgpu/amdgpu_device.hh"
+#include "mem/packet.hh"
+#include "mem/packet_access.hh"
+#include "mem/request.hh"
 #include "sim/byteswap.hh"
 
 namespace gem5
@@ -200,9 +203,14 @@ MI300XGem5Cosim::acceptConnection()
     clientEvents[cli_fd] = std::make_unique<ClientEvent>(cli_fd, this);
     pollQueue.schedule(clientEvents[cli_fd].get());
 
-    if (primaryClientFd < 0) {
-        primaryClientFd = cli_fd;
+    // First connection = MMIO (sync), second = events (async)
+    if (mmioClientFd < 0) {
+        mmioClientFd = cli_fd;
+        inform("MI300XGem5Cosim: MMIO connection established fd=%d", cli_fd);
+    } else if (eventClientFd < 0) {
+        eventClientFd = cli_fd;
         connected = true;
+        inform("MI300XGem5Cosim: Event connection established fd=%d", cli_fd);
     }
 }
 
@@ -213,8 +221,11 @@ MI300XGem5Cosim::closeClient(int fd)
     close(fd);
     clientEvents.erase(fd);
 
-    if (fd == primaryClientFd) {
-        primaryClientFd = -1;
+    if (fd == mmioClientFd) {
+        mmioClientFd = -1;
+        connected = false;
+    } else if (fd == eventClientFd) {
+        eventClientFd = -1;
         connected = false;
     }
 }
@@ -349,7 +360,8 @@ MI300XGem5Cosim::handleMmioRead(int fd, const CosimMsgHeader &msg)
     if (accessSize == 0 || accessSize > 8)
         accessSize = 4;
 
-    uint64_t value = readFromGpuDevice(msg.addr, accessSize, MMIO_BAR);
+    // QEMU BAR0 (MMIO) -> gem5 MMIO_BAR (BAR5)
+    uint64_t value = gpuMmioRead(msg.addr, accessSize);
 
     DPRINTF(MI300XCosim,
             "MMIO Read: addr=0x%lx access_size=%u -> value=0x%lx\n",
@@ -376,7 +388,8 @@ MI300XGem5Cosim::handleMmioWrite(int fd, const CosimMsgHeader &msg)
             "MMIO Write: addr=0x%lx access_size=%u value=0x%lx\n",
             msg.addr, accessSize, msg.data);
 
-    writeToGpuDevice(msg.addr, accessSize, msg.data, MMIO_BAR);
+    // QEMU BAR0 (MMIO) -> gem5 MMIO_BAR (BAR5)
+    gpuMmioWrite(msg.addr, accessSize, msg.data);
 
     // MMIO writes are fire-and-forget from QEMU's perspective
     // (QEMU's mi300x_send_msg passes NULL response for writes)
@@ -389,7 +402,8 @@ MI300XGem5Cosim::handleDoorbellRead(int fd, const CosimMsgHeader &msg)
     if (accessSize == 0 || accessSize > 8)
         accessSize = 4;
 
-    uint64_t value = readFromGpuDevice(msg.addr, accessSize, DOORBELL_BAR);
+    // QEMU BAR4 (Doorbell) -> gem5 DOORBELL_BAR (BAR2)
+    uint64_t value = gpuDoorbellRead(msg.addr, accessSize);
 
     DPRINTF(MI300XCosim,
             "Doorbell Read: addr=0x%lx access_size=%u -> value=0x%lx\n",
@@ -416,119 +430,145 @@ MI300XGem5Cosim::handleDoorbellWrite(int fd, const CosimMsgHeader &msg)
             "Doorbell Write: addr=0x%lx access_size=%u value=0x%lx\n",
             msg.addr, accessSize, msg.data);
 
-    writeToGpuDevice(msg.addr, accessSize, msg.data, DOORBELL_BAR);
+    // QEMU BAR4 (Doorbell) -> gem5 DOORBELL_BAR (BAR2)
+    gpuDoorbellWrite(msg.addr, accessSize, msg.data);
 
     // Doorbell writes are fire-and-forget (QEMU sends NULL response)
 }
 
-// ---- MMIO Forwarding to AMDGPUDevice ----
+// ======================================================================
+// GPU Device Forwarding
+//
+// These methods create proper gem5 Packet objects and call the
+// AMDGPUDevice's BAR-specific methods directly, matching exactly
+// what readDevice/writeDevice do in amdgpu_device.cc.
+//
+// BAR mapping (QEMU -> gem5):
+//   QEMU BAR0 (MMIO)     -> gem5 readMMIO/writeMMIO  (MMIO_BAR=5)
+//   QEMU BAR2 (VRAM)     -> gem5 readFrame/writeFrame (FRAMEBUFFER_BAR=0)
+//   QEMU BAR4 (Doorbell) -> gem5 readDoorbell/writeDoorbell (DOORBELL_BAR=2)
+// ======================================================================
 
 uint64_t
-MI300XGem5Cosim::readFromGpuDevice(uint64_t offset, uint32_t size,
-                                   int gem5Bar)
+MI300XGem5Cosim::gpuMmioRead(uint64_t offset, uint32_t size)
 {
     fatal_if(!gpuDevice, "MI300XGem5Cosim: gpu_device not set");
 
-    if (gem5Bar == MMIO_BAR) {
-        if (size <= sizeof(uint32_t)) {
-            return gpuDevice->getRegVal(offset);
-        }
-
-        // Handle 8-byte reads by composing two 32-bit reads
-        uint64_t value = 0;
-        uint32_t remaining = size;
-        uint64_t cur_addr = offset;
-        uint32_t byte_offset = 0;
-
-        while (remaining >= 4) {
-            uint32_t reg_val = gpuDevice->getRegVal(cur_addr);
-            memcpy(reinterpret_cast<uint8_t *>(&value) + byte_offset,
-                   &reg_val, sizeof(uint32_t));
-            cur_addr += 4;
-            byte_offset += 4;
-            remaining -= 4;
-        }
-
-        if (remaining > 0) {
-            uint32_t reg_val = gpuDevice->getRegVal(cur_addr);
-            memcpy(reinterpret_cast<uint8_t *>(&value) + byte_offset,
-                   &reg_val, remaining);
-        }
-
-        return value;
-    }
-
-    // For doorbell and framebuffer BARs
-    DPRINTF(MI300XCosim,
-            "Read from gem5 BAR %d offset 0x%lx size %u\n",
-            gem5Bar, offset, size);
-
-    if (size <= sizeof(uint32_t)) {
+    // For 4-byte reads, use getRegVal which handles MMIO dispatch
+    if (size == sizeof(uint32_t)) {
         return gpuDevice->getRegVal(offset);
     }
 
-    uint64_t value = 0;
-    for (uint32_t i = 0; i < size; i += 4) {
-        uint32_t partial = gpuDevice->getRegVal(offset + i);
-        uint32_t copySize = std::min((uint32_t)4, size - i);
-        memcpy(reinterpret_cast<uint8_t *>(&value) + i, &partial, copySize);
+    // For 8-byte reads, compose two 32-bit reads
+    if (size == sizeof(uint64_t)) {
+        uint64_t lo = gpuDevice->getRegVal(offset);
+        uint64_t hi = gpuDevice->getRegVal(offset + 4);
+        return lo | (hi << 32);
     }
-    return value;
+
+    // Sub-dword: read 32-bit and mask
+    uint32_t val = gpuDevice->getRegVal(offset & ~0x3ULL);
+    uint32_t shift = (offset & 0x3) * 8;
+    uint64_t mask = (1ULL << (size * 8)) - 1;
+    return (val >> shift) & mask;
 }
 
 void
-MI300XGem5Cosim::writeToGpuDevice(uint64_t offset, uint32_t size,
-                                  uint64_t data, int gem5Bar)
+MI300XGem5Cosim::gpuMmioWrite(uint64_t offset, uint32_t size, uint64_t data)
 {
     fatal_if(!gpuDevice, "MI300XGem5Cosim: gpu_device not set");
 
-    if (gem5Bar == MMIO_BAR) {
-        if (size <= sizeof(uint32_t)) {
-            gpuDevice->setRegVal(offset, static_cast<uint32_t>(data));
-            return;
-        }
-
-        uint32_t remaining = size;
-        uint64_t cur_addr = offset;
-        uint32_t byte_offset = 0;
-
-        while (remaining >= 4) {
-            uint32_t reg_val;
-            memcpy(&reg_val,
-                   reinterpret_cast<const uint8_t *>(&data) + byte_offset,
-                   sizeof(uint32_t));
-            gpuDevice->setRegVal(cur_addr, reg_val);
-            cur_addr += 4;
-            byte_offset += 4;
-            remaining -= 4;
-        }
-
-        if (remaining > 0) {
-            uint32_t reg_val = gpuDevice->getRegVal(cur_addr);
-            memcpy(&reg_val,
-                   reinterpret_cast<const uint8_t *>(&data) + byte_offset,
-                   remaining);
-            gpuDevice->setRegVal(cur_addr, reg_val);
-        }
-        return;
-    }
-
-    DPRINTF(MI300XCosim,
-            "Write to gem5 BAR %d offset 0x%lx size %u value 0x%lx\n",
-            gem5Bar, offset, size, data);
-
-    if (size <= sizeof(uint32_t)) {
+    if (size == sizeof(uint32_t)) {
         gpuDevice->setRegVal(offset, static_cast<uint32_t>(data));
         return;
     }
 
-    for (uint32_t i = 0; i < size; i += 4) {
-        uint32_t partial;
-        uint32_t copySize = std::min((uint32_t)4, size - i);
-        memcpy(&partial, reinterpret_cast<const uint8_t *>(&data) + i,
-               copySize);
-        gpuDevice->setRegVal(offset + i, partial);
+    if (size == sizeof(uint64_t)) {
+        gpuDevice->setRegVal(offset, static_cast<uint32_t>(data));
+        gpuDevice->setRegVal(offset + 4,
+                             static_cast<uint32_t>(data >> 32));
+        return;
     }
+
+    // Sub-dword: read-modify-write
+    uint32_t cur = gpuDevice->getRegVal(offset & ~0x3ULL);
+    uint32_t shift = (offset & 0x3) * 8;
+    uint64_t mask = (1ULL << (size * 8)) - 1;
+    cur &= ~(mask << shift);
+    cur |= (data & mask) << shift;
+    gpuDevice->setRegVal(offset & ~0x3ULL, cur);
+}
+
+uint64_t
+MI300XGem5Cosim::gpuDoorbellRead(uint64_t offset, uint32_t size)
+{
+    fatal_if(!gpuDevice, "MI300XGem5Cosim: gpu_device not set");
+
+    // Create a proper packet to call readDoorbell
+    uint64_t pkt_data = 0;
+    RequestPtr req = std::make_shared<Request>(
+        offset, size, 0, gpuDevice->vramRequestorId());
+    PacketPtr pkt = Packet::createRead(req);
+    pkt->dataStatic(reinterpret_cast<uint8_t *>(&pkt_data));
+
+    gpuDevice->readDoorbell(pkt, offset);
+
+    uint64_t value = pkt->getUintX(ByteOrder::little);
+    delete pkt;
+
+    return value;
+}
+
+void
+MI300XGem5Cosim::gpuDoorbellWrite(uint64_t offset, uint32_t size,
+                                  uint64_t data)
+{
+    fatal_if(!gpuDevice, "MI300XGem5Cosim: gpu_device not set");
+
+    // Create a proper packet to call writeDoorbell
+    // writeDoorbell uses pkt->getLE<uint64_t>() for doorbell value
+    uint64_t pkt_data = htole(data);
+    RequestPtr req = std::make_shared<Request>(
+        offset, size, 0, gpuDevice->vramRequestorId());
+    PacketPtr pkt = Packet::createWrite(req);
+    pkt->dataStatic(reinterpret_cast<uint8_t *>(&pkt_data));
+
+    gpuDevice->writeDoorbell(pkt, offset);
+    delete pkt;
+}
+
+uint64_t
+MI300XGem5Cosim::gpuFrameRead(uint64_t offset, uint32_t size)
+{
+    fatal_if(!gpuDevice, "MI300XGem5Cosim: gpu_device not set");
+
+    uint64_t pkt_data = 0;
+    RequestPtr req = std::make_shared<Request>(
+        offset, size, 0, gpuDevice->vramRequestorId());
+    PacketPtr pkt = Packet::createRead(req);
+    pkt->dataStatic(reinterpret_cast<uint8_t *>(&pkt_data));
+
+    gpuDevice->readFrame(pkt, offset);
+
+    uint64_t value = pkt->getUintX(ByteOrder::little);
+    delete pkt;
+
+    return value;
+}
+
+void
+MI300XGem5Cosim::gpuFrameWrite(uint64_t offset, uint32_t size, uint64_t data)
+{
+    fatal_if(!gpuDevice, "MI300XGem5Cosim: gpu_device not set");
+
+    uint64_t pkt_data = htole(data);
+    RequestPtr req = std::make_shared<Request>(
+        offset, size, 0, gpuDevice->vramRequestorId());
+    PacketPtr pkt = Packet::createWrite(req);
+    pkt->dataStatic(reinterpret_cast<uint8_t *>(&pkt_data));
+
+    gpuDevice->writeFrame(pkt, offset);
+    delete pkt;
 }
 
 // ---- DMA and Interrupt (gem5 -> QEMU) ----
@@ -536,7 +576,7 @@ MI300XGem5Cosim::writeToGpuDevice(uint64_t offset, uint32_t size,
 bool
 MI300XGem5Cosim::sendDmaRead(uint64_t addr, uint64_t len)
 {
-    if (primaryClientFd < 0)
+    if (eventClientFd < 0)
         return false;
 
     CosimMsgHeader msg{};
@@ -546,21 +586,20 @@ MI300XGem5Cosim::sendDmaRead(uint64_t addr, uint64_t len)
     msg.data = len;
     msg.size = 0;
 
-    if (!sendAll(primaryClientFd, &msg, COSIM_MSG_HDR_SIZE)) {
+    if (!sendAll(eventClientFd, &msg, COSIM_MSG_HDR_SIZE)) {
         return false;
     }
 
-    // The QEMU event thread will read guest memory and send back
-    // a MmioResp with the payload following the header
+    // QEMU event thread reads guest memory and sends back
+    // a MmioResp with payload following the header
     CosimMsgHeader resp;
-    if (!recvAll(primaryClientFd, &resp, COSIM_MSG_HDR_SIZE)) {
+    if (!recvAll(eventClientFd, &resp, COSIM_MSG_HDR_SIZE)) {
         return false;
     }
 
-    // Read payload data if present
     uint32_t payloadSize = resp.size;
     if (payloadSize > 0 && payloadSize <= COSIM_DMA_BUF_SIZE) {
-        if (!recvAll(primaryClientFd, dmaBuf, payloadSize)) {
+        if (!recvAll(eventClientFd, dmaBuf, payloadSize)) {
             return false;
         }
     }
@@ -572,7 +611,7 @@ bool
 MI300XGem5Cosim::sendDmaWrite(uint64_t addr, uint64_t len,
                               const uint8_t *data)
 {
-    if (primaryClientFd < 0)
+    if (eventClientFd < 0)
         return false;
 
     if (len > COSIM_DMA_BUF_SIZE) {
@@ -587,12 +626,11 @@ MI300XGem5Cosim::sendDmaWrite(uint64_t addr, uint64_t len,
     msg.data = len;
     msg.size = len;
 
-    // Send header followed by payload
-    if (!sendAll(primaryClientFd, &msg, COSIM_MSG_HDR_SIZE)) {
+    if (!sendAll(eventClientFd, &msg, COSIM_MSG_HDR_SIZE)) {
         return false;
     }
     if (data && len > 0) {
-        if (!sendAll(primaryClientFd, data, len)) {
+        if (!sendAll(eventClientFd, data, len)) {
             return false;
         }
     }
@@ -603,7 +641,7 @@ MI300XGem5Cosim::sendDmaWrite(uint64_t addr, uint64_t len,
 bool
 MI300XGem5Cosim::sendIrqRaise(uint32_t vector)
 {
-    if (primaryClientFd < 0)
+    if (eventClientFd < 0)
         return false;
 
     CosimMsgHeader msg{};
@@ -612,13 +650,13 @@ MI300XGem5Cosim::sendIrqRaise(uint32_t vector)
     msg.data = vector;
     msg.size = 0;
 
-    return sendAll(primaryClientFd, &msg, COSIM_MSG_HDR_SIZE);
+    return sendAll(eventClientFd, &msg, COSIM_MSG_HDR_SIZE);
 }
 
 bool
 MI300XGem5Cosim::sendIrqLower(uint32_t vector)
 {
-    if (primaryClientFd < 0)
+    if (eventClientFd < 0)
         return false;
 
     CosimMsgHeader msg{};
@@ -627,7 +665,7 @@ MI300XGem5Cosim::sendIrqLower(uint32_t vector)
     msg.data = vector;
     msg.size = 0;
 
-    return sendAll(primaryClientFd, &msg, COSIM_MSG_HDR_SIZE);
+    return sendAll(eventClientFd, &msg, COSIM_MSG_HDR_SIZE);
 }
 
 } // namespace gem5
