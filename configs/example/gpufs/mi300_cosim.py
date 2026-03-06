@@ -35,14 +35,26 @@ socket bridge (MI300XGem5Cosim).  The HOST side (CPU, kernel, ROCm driver)
 runs inside QEMU with a Q35 chipset, and QEMU's "mi300x-gem5" PCIe device
 forwards MMIO/Doorbell/DMA over a Unix domain socket to this gem5 process.
 
+Shared Memory Architecture:
+    QEMU and gem5 share two POSIX shared memory regions:
+    1. Host RAM (/dev/shm/cosim-guest-ram) - Guest physical memory shared
+       between QEMU's KVM and gem5's DMA engines (HSAPP, GCP, IH, SDMA).
+       This allows GPU DMA reads/writes to directly access guest memory.
+    2. VRAM (/dev/shm/mi300x-vram) - GPU device memory shared between
+       QEMU's driver writes and gem5's shader execution.
+
 Usage:
     # Terminal 1 - start gem5 (waits for QEMU to connect):
     build/VEGA_X86/gem5.opt configs/example/gpufs/mi300_cosim.py \\
         --socket-path /tmp/gem5-mi300x.sock \\
-        --shmem-path  /mi300x-vram
+        --shmem-path  /mi300x-vram \\
+        --shmem-host-path /cosim-guest-ram
 
-    # Terminal 2 - start QEMU (connects to gem5):
-    qemu-system-x86_64 -machine q35 -enable-kvm -m 8G -smp 4 \\
+    # Terminal 2 - start QEMU (connects to gem5, with shared memory):
+    qemu-system-x86_64 -machine q35 -enable-kvm -smp 4 \\
+        -object memory-backend-file,id=mem0,size=8G,\\
+                mem-path=/dev/shm/cosim-guest-ram,share=on \\
+        -numa node,memdev=mem0 \\
         -device mi300x-gem5,gem5-socket=/tmp/gem5-mi300x.sock,\\
                 shmem-path=/dev/shm/mi300x-vram \\
         -drive file=disk-image.qcow2,format=qcow2 \\
@@ -116,6 +128,15 @@ def addCosimOptions(parser):
         default="Crossbar",
         help="Network topology for GPU side",
     )
+    parser.add_argument(
+        "--shmem-host-path",
+        type=str,
+        default="/cosim-guest-ram",
+        help="POSIX shared memory name for host (guest) RAM "
+        "(e.g. /cosim-guest-ram). QEMU must be configured with "
+        "-object memory-backend-file,mem-path=/dev/shm/cosim-guest-ram,"
+        "share=on to share guest RAM with gem5.",
+    )
 
 
 def buildCosimSystem(args):
@@ -144,7 +165,14 @@ def buildCosimSystem(args):
     # We still need a memory bus for DMA devices
     system.membus = SystemXBar()
 
-    # Host memory range (for DMA from GPU to guest RAM via cosim bridge)
+    # Host memory range (for DMA from GPU to guest RAM via cosim bridge).
+    # Use shared backstore so QEMU and gem5 share the same physical memory.
+    # QEMU must be configured with:
+    #   -object memory-backend-file,id=mem0,size=8G,
+    #           mem-path=/dev/shm/cosim-guest-ram,share=on
+    #   -numa node,memdev=mem0
+    system.shared_backstore = args.shmem_host_path
+    system.auto_unlink_shared_backstore = True
     system.mem_ranges = [AddrRange(args.mem_size)]
     system.memories = [SimpleMemory(range=system.mem_ranges[0])]
     system.memories[0].port = system.membus.mem_side_ports
@@ -302,6 +330,11 @@ def buildCosimSystem(args):
     elif args.gpu_device == "MI355X":
         gpu_dev.DeviceID = 0x75A0
         gpu_dev.BAR5 = PciMemBar(size="2MiB")
+
+    # Share VRAM backing store with QEMU via POSIX shared memory.
+    # This allows both QEMU (driver side) and gem5 (shader side) to
+    # see the same VRAM contents (kernel code, data buffers, etc.).
+    gpu_dev.vram_shared_backstore = args.shmem_path
 
     gpu_dev.SubsystemVendorID = 0x1002
     gpu_dev.SubsystemID = 0x0C34
@@ -506,10 +539,12 @@ if __name__ == "__m5_main__":
 
     print("=" * 60)
     print("gem5 MI300X co-simulation server ready")
-    print(f"  Socket:  {args.socket_path}")
-    print(f"  SHM:     {args.shmem_path}")
-    print(f"  VRAM:    {args.dgpu_mem_size}")
-    print(f"  CUs:     {args.num_compute_units}")
+    print(f"  Socket:     {args.socket_path}")
+    print(f"  VRAM SHM:   {args.shmem_path}")
+    print(f"  Host SHM:   {args.shmem_host_path}")
+    print(f"  VRAM size:  {args.dgpu_mem_size}")
+    print(f"  Host RAM:   {args.mem_size}")
+    print(f"  CUs:        {args.num_compute_units}")
     print("Waiting for QEMU to connect...")
     print("=" * 60)
 

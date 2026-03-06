@@ -168,6 +168,9 @@ class AMDGPUDevice : public PciEndpoint
      */
     System *system;
 
+    /* Co-simulation bridge (nullptr when not in cosim mode) */
+    MI300XGem5Cosim *cosimBridge = nullptr;
+
     /* Device information */
     GfxVersion gfx_version = GfxVersion::gfx900;
     const int gpuId;
@@ -239,6 +242,10 @@ class AMDGPUDevice : public PciEndpoint
     uint16_t getVMID(Addr doorbell) { return doorbellVMIDMap[doorbell]; }
     std::unordered_map<uint16_t, std::set<int>>& getUsedVMIDs();
     void insertQId(uint16_t vmid, int id);
+
+    /* Co-simulation bridge accessor */
+    void setCosimBridge(MI300XGem5Cosim *bridge) { cosimBridge = bridge; }
+    MI300XGem5Cosim* getCosimBridge() const { return cosimBridge; }
 
     /* Device information */
     GfxVersion getGfxVersion() const { return gfx_version; }

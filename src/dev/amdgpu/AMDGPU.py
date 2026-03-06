@@ -101,6 +101,12 @@ class AMDGPUDevice(PciEndpoint):
     memories = VectorParam.AbstractMemory([], "All memories in the device")
     device_ih = Param.AMDGPUInterruptHandler("GPU Interrupt handler")
 
+    vram_shared_backstore = Param.String(
+        "",
+        "POSIX shared memory name for VRAM backing store. "
+        "Used in cosim mode to share VRAM between QEMU and gem5.",
+    )
+
 
 class SDMAEngine(DmaVirtDevice):
     type = "SDMAEngine"

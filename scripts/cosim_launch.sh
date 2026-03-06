@@ -40,7 +40,9 @@ KERNEL="${KERNEL:-}"
 
 SOCKET_PATH="${SOCKET_PATH:-/tmp/gem5-mi300x.sock}"
 SHMEM_PATH="${SHMEM_PATH:-/mi300x-vram}"
+SHMEM_HOST_PATH="${SHMEM_HOST_PATH:-/cosim-guest-ram}"
 SHMEM_FILE="/dev/shm${SHMEM_PATH}"
+SHMEM_HOST_FILE="/dev/shm${SHMEM_HOST_PATH}"
 
 VRAM_SIZE="${VRAM_SIZE:-16GiB}"
 NUM_CUS="${NUM_CUS:-40}"
@@ -158,6 +160,7 @@ cleanup() {
     [[ -n "$GEM5_PID" ]] && kill "$GEM5_PID" 2>/dev/null || true
     rm -f "$SOCKET_PATH"
     rm -f "$SHMEM_FILE"
+    rm -f "$SHMEM_HOST_FILE"
     wait 2>/dev/null || true
     echo "Done."
 }
@@ -167,16 +170,19 @@ trap cleanup EXIT INT TERM
 
 rm -f "$SOCKET_PATH"
 rm -f "$SHMEM_FILE"
+rm -f "$SHMEM_HOST_FILE"
 
 # ---- Start gem5 ----
 
 echo "============================================================"
 echo "Starting gem5 MI300X co-simulation server..."
-echo "  Binary:  $GEM5_BIN"
-echo "  Socket:  $SOCKET_PATH"
-echo "  SHM:     $SHMEM_PATH"
-echo "  VRAM:    $VRAM_SIZE"
-echo "  CUs:     $NUM_CUS"
+echo "  Binary:    $GEM5_BIN"
+echo "  Socket:    $SOCKET_PATH"
+echo "  VRAM SHM:  $SHMEM_PATH"
+echo "  Host SHM:  $SHMEM_HOST_PATH"
+echo "  VRAM:      $VRAM_SIZE"
+echo "  Host RAM:  $HOST_MEM"
+echo "  CUs:       $NUM_CUS"
 echo "============================================================"
 
 GEM5_CMD=(
@@ -191,8 +197,10 @@ GEM5_CMD+=(
     "$GEM5_CONFIG"
     --socket-path="$SOCKET_PATH"
     --shmem-path="$SHMEM_PATH"
+    --shmem-host-path="$SHMEM_HOST_PATH"
     --dgpu-mem-size="$VRAM_SIZE"
     --num-compute-units="$NUM_CUS"
+    --mem-size="$HOST_MEM"
 )
 
 "${GEM5_CMD[@]}" &
@@ -239,8 +247,10 @@ QEMU_CMD=(
     "$QEMU_BIN"
     -machine q35
     $KVM_OPTS
-    -m "$HOST_MEM"
     -smp "$HOST_CPUS"
+    # Shared memory backend for guest RAM - allows gem5 to DMA directly
+    -object "memory-backend-file,id=mem0,size=${HOST_MEM},mem-path=${SHMEM_HOST_FILE},share=on"
+    -numa "node,memdev=mem0"
     -kernel "$KERNEL"
     -append "$KCMDLINE"
     -drive "file=$DISK_IMAGE,format=raw,if=virtio"

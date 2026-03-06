@@ -35,6 +35,7 @@
 
 #include "debug/AMDGPUDevice.hh"
 #include "dev/amdgpu/amdgpu_nbio.hh"
+#include "dev/amdgpu/mi300x_gem5_cosim.hh"
 #include "dev/amdgpu/amdgpu_vm.hh"
 #include "dev/amdgpu/interrupt_handler.hh"
 #include "dev/amdgpu/pm4_packet_processor.hh"
@@ -60,7 +61,8 @@ AMDGPUDevice::AMDGPUDevice(const AMDGPUDeviceParams &p)
       checkpoint_before_mmios(p.checkpoint_before_mmios),
       init_interrupt_count(0),
       _lastVMID(0),
-      deviceMem(name() + ".deviceMem", p.memories, false, "", false),
+      deviceMem(name() + ".deviceMem", p.memories, false,
+                p.vram_shared_backstore, false),
       system(p.system),
       gpuId(p.gpu_id)
 {
@@ -875,6 +877,12 @@ AMDGPUDevice::getSDMAEngine(Addr offset)
 void
 AMDGPUDevice::intrPost()
 {
+    if (cosimBridge) {
+        // In cosim mode, route interrupts to QEMU via the cosim socket
+        // rather than through gem5's PCI hierarchy (which has no host).
+        cosimBridge->sendIrqRaise(0);
+        return;
+    }
     PciEndpoint::intrPost();
 }
 

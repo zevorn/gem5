@@ -80,6 +80,12 @@ MI300XGem5Cosim::~MI300XGem5Cosim()
 void
 MI300XGem5Cosim::startup()
 {
+    // Register this cosim bridge with the GPU device so it can route
+    // interrupts and other operations through the cosim socket.
+    if (gpuDevice) {
+        gpuDevice->setCosimBridge(this);
+    }
+
     if (socketPath.empty()) {
         warn("MI300XGem5Cosim: No socket path configured, "
              "co-simulation disabled.\n");
