@@ -94,7 +94,7 @@ parser.add_argument(
 parser.add_argument(
     "--app",
     type=str,
-    required=True,
+    default=None,
     help="Path to GPU application, python script, or bash script to run",
 )
 
@@ -140,10 +140,14 @@ board = ViperBoard(
 disk = DiskImageResource(local_path=args.image, root_partition="1")
 kernel = FileResource(local_path=args.kernel)
 
+readfile = ""
+if args.app:
+    readfile = board.make_gpu_app(gpu0, args.app, args.opts)
+
 board.set_kernel_disk_workload(
     kernel=kernel,
     disk_image=disk,
-    readfile_contents=board.make_gpu_app(gpu0, args.app, args.opts),
+    readfile_contents=readfile,
 )
 
 simulator = Simulator(board=board)

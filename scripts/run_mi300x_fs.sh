@@ -1,40 +1,55 @@
 #!/bin/bash
 # =============================================================================
-# gem5 MI300X Full-System GPU Simulation - Complete Setup & Run Script
+# gem5 MI300X Full-System GPU Simulation - Setup & Run Script
 #
-# This script handles:
-#   1. Building gem5 (VEGA_X86)
-#   2. Building the disk image (Ubuntu 24.04 + ROCm 7.0)
-#   3. Building GPU test applications
-#   4. Running MI300X full-system simulation
-#
-# Requirements:
-#   - x86_64 Linux host with KVM (/dev/kvm)
-#   - qemu-system-x86_64 (for disk image build)
-#   - Docker (for GPU app compilation)
-#   - ~60GB free disk space
-#   - ~16GB RAM
+# Adapted for the local development layout:
+#   /home/zevorn/cosim/
+#     gem5/                     <- gem5 source & build
+#       gem5-resources/         <- disk image, kernel, GPU apps
+#       scripts/                <- this script
+#     qemu/                     <- QEMU source (for cosim mode)
 #
 # Usage:
-#   ./scripts/run_mi300x_fs.sh build-all     # Full setup from scratch
-#   ./scripts/run_mi300x_fs.sh build-gem5    # Build gem5 only
-#   ./scripts/run_mi300x_fs.sh build-disk    # Build disk image only
-#   ./scripts/run_mi300x_fs.sh build-app     # Build GPU test app only
-#   ./scripts/run_mi300x_fs.sh run [app]     # Run simulation
-#   ./scripts/run_mi300x_fs.sh run-atomic [app]  # Run without KVM (slow)
+#   ./scripts/run_mi300x_fs.sh build-gem5          # Build gem5 via Docker
+#   ./scripts/run_mi300x_fs.sh build-qemu          # Build QEMU (mi300x-gem5 cosim device)
+#   ./scripts/run_mi300x_fs.sh build-disk           # Build disk image (needs KVM + qemu)
+#   ./scripts/run_mi300x_fs.sh build-app [name]     # Build GPU test app (default: square)
+#   ./scripts/run_mi300x_fs.sh build-all            # Full setup from scratch
+#   ./scripts/run_mi300x_fs.sh run [app]            # Run with stdlib config (KVM)
+#   ./scripts/run_mi300x_fs.sh run-legacy [app]     # Run with legacy gpufs/mi300.py
+#   ./scripts/run_mi300x_fs.sh status               # Show build status
 # =============================================================================
 
 set -euo pipefail
 
+# ---- Path layout ----
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GEM5_DIR="$(dirname "$SCRIPT_DIR")"
-RESOURCES_DIR="${GEM5_DIR}/../gem5-resources"
+COSIM_DIR="$(dirname "$GEM5_DIR")"
+RESOURCES_DIR="${GEM5_DIR}/gem5-resources"
 
-# Paths to built artifacts
-DISK_IMAGE="${RESOURCES_DIR}/src/x86-ubuntu-gpu-ml/disk-image/x86-ubuntu-rocm70"
+# Built artifacts (ROCm 7.0 disk image)
+DISK_IMAGE_DIR="${RESOURCES_DIR}/src/x86-ubuntu-gpu-ml/disk-image"
+DISK_IMAGE="${DISK_IMAGE_DIR}/x86-ubuntu-rocm70"
 KERNEL="${RESOURCES_DIR}/src/x86-ubuntu-gpu-ml/vmlinux-rocm70"
 SQUARE_APP="${RESOURCES_DIR}/src/gpu/square/bin.default/square.default"
 GEM5_BIN="${GEM5_DIR}/build/VEGA_X86/gem5.opt"
+
+# QEMU
+QEMU_DIR="${COSIM_DIR}/qemu"
+QEMU_BUILD_DIR="${QEMU_DIR}/build"
+QEMU_BIN="${QEMU_BUILD_DIR}/qemu-system-x86_64"
+
+# Docker images
+GEM5_BUILD_IMAGE="${GEM5_BUILD_IMAGE:-ghcr.io/gem5/ubuntu-24.04_all-dependencies:v24-0}"
+GPU_APP_BUILD_IMAGE="${GPU_APP_BUILD_IMAGE:-ghcr.io/gem5/gpu-fs}"
+
+# gem5 config files
+STDLIB_CONFIG="${GEM5_DIR}/configs/example/gem5_library/x86-mi300x-gpu.py"
+LEGACY_CONFIG="${GEM5_DIR}/configs/example/gpufs/mi300.py"
+
+# ---- Colors ----
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -45,44 +60,45 @@ info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
-# ==========================
-# Step 0: Check prerequisites
-# ==========================
-check_prerequisites() {
-    info "Checking prerequisites..."
+# ---- Helpers ----
 
-    if [ "$(uname -m)" != "x86_64" ]; then
-        error "x86_64 host required (current: $(uname -m))"
-    fi
-
-    local missing=()
-    command -v git >/dev/null || missing+=(git)
-    command -v python3 >/dev/null || missing+=(python3)
-    command -v scons >/dev/null || missing+=(scons)
-
-    if [ ${#missing[@]} -gt 0 ]; then
-        error "Missing required tools: ${missing[*]}"
-    fi
-
-    info "Prerequisites OK"
+require_docker() {
+    command -v docker >/dev/null || error "docker not found"
+    docker info >/dev/null 2>&1 || error "Docker daemon not running. Try: sudo dockerd &"
 }
 
 check_kvm() {
-    if [ ! -e /dev/kvm ]; then
-        warn "KVM not available (/dev/kvm missing)"
-        warn "Disk image build requires KVM"
-        warn "Simulation can run with --cpu-type=AtomicSimpleCPU (very slow)"
-        return 1
+    if [ -e /dev/kvm ]; then
+        info "KVM available"
+        return 0
     fi
-    info "KVM available"
-    return 0
+    warn "KVM not available (/dev/kvm missing)"
+    return 1
+}
+
+# Translate host path to container path (/gem5/...)
+to_container_path() {
+    echo "${1/$GEM5_DIR//gem5}"
+}
+
+# Run gem5 binary inside Docker (Ubuntu 24.04 deps) with KVM passthrough
+run_gem5_docker() {
+    require_docker
+    local docker_args=("--rm" "-u" "$(id -u):$(id -g)"
+        "-v" "${GEM5_DIR}:/gem5" "-w" "/gem5"
+        "-e" "PYTHONPATH=/usr/lib/python3.12/lib-dynload"
+        "-p" "3456:3456" "-p" "7000:7000")
+    if [ -e /dev/kvm ]; then
+        docker_args+=("--device" "/dev/kvm")
+    fi
+    docker run "${docker_args[@]}" "${GEM5_RUN_IMAGE:-gem5-run:local}" "$@"
 }
 
 # ==========================
-# Step 1: Build gem5
+# Build gem5 (via Docker)
 # ==========================
 build_gem5() {
-    info "Building gem5 (VEGA_X86)..."
+    info "Building gem5 (VEGA_X86) via Docker..."
 
     if [ -f "$GEM5_BIN" ]; then
         info "gem5 binary already exists: $GEM5_BIN"
@@ -91,21 +107,63 @@ build_gem5() {
         [[ ! $REPLY =~ ^[Yy]$ ]] && return 0
     fi
 
-    cd "$GEM5_DIR"
-    scons build/VEGA_X86/gem5.opt -j"$(nproc)" 2>&1 | tail -20
+    require_docker
 
-    if [ ! -f "$GEM5_BIN" ]; then
-        error "gem5 build failed"
-    fi
-    info "gem5 built successfully: $GEM5_BIN"
+    local nproc_val
+    nproc_val="$(nproc)"
+
+    info "Using image: $GEM5_BUILD_IMAGE"
+    info "Build parallelism: -j${nproc_val}"
+
+    docker run --rm \
+        -v "${GEM5_DIR}:/gem5" \
+        -w /gem5 \
+        "$GEM5_BUILD_IMAGE" \
+        scons build/VEGA_X86/gem5.opt -j"${nproc_val}"
+
+    [ -f "$GEM5_BIN" ] || error "gem5 build failed"
+    info "gem5 built: $GEM5_BIN"
 }
 
 # ==========================
-# Step 2: Get gem5-resources
+# Build QEMU (with mi300x-gem5 cosim device)
+# ==========================
+build_qemu() {
+    info "Building QEMU (x86_64-softmmu) with mi300x-gem5 device..."
+
+    [ -d "$QEMU_DIR" ] || error "QEMU source not found: $QEMU_DIR"
+
+    if [ -f "$QEMU_BIN" ]; then
+        info "QEMU binary already exists: $QEMU_BIN"
+        read -p "Rebuild? [y/N] " -n 1 -r
+        echo
+        [[ ! $REPLY =~ ^[Yy]$ ]] && return 0
+    fi
+
+    mkdir -p "$QEMU_BUILD_DIR"
+    cd "$QEMU_BUILD_DIR"
+
+    if [ ! -f "$QEMU_BUILD_DIR/build.ninja" ]; then
+        info "Configuring QEMU..."
+        "${QEMU_DIR}/configure" --target-list=x86_64-softmmu
+    fi
+
+    local nproc_val
+    nproc_val="$(nproc)"
+    info "Build parallelism: -j${nproc_val}"
+
+    make -j"${nproc_val}"
+
+    [ -f "$QEMU_BIN" ] || error "QEMU build failed"
+    info "QEMU built: $QEMU_BIN"
+}
+
+# ==========================
+# Get gem5-resources
 # ==========================
 get_resources() {
     if [ -d "$RESOURCES_DIR" ]; then
-        info "gem5-resources already exists: $RESOURCES_DIR"
+        info "gem5-resources exists: $RESOURCES_DIR"
         return 0
     fi
 
@@ -115,11 +173,11 @@ get_resources() {
 }
 
 # ==========================
-# Step 3: Build disk image
+# Build disk image
 # ==========================
 build_disk_image() {
-    info "Building disk image (Ubuntu 24.04 + ROCm 7.0)..."
-    info "This will take ~30 minutes and requires ~60GB disk space"
+    info "Building disk image (Ubuntu 22.04 + ROCm)..."
+    info "This takes ~30 min and needs ~60GB disk space"
 
     command -v qemu-system-x86_64 >/dev/null || \
         error "qemu-system-x86_64 not found. Install: sudo apt install qemu-system-x86"
@@ -128,7 +186,7 @@ build_disk_image() {
     check_kvm || error "KVM required for disk image build"
 
     if [ -f "$DISK_IMAGE" ]; then
-        info "Disk image already exists: $DISK_IMAGE"
+        info "Disk image exists: $DISK_IMAGE"
         read -p "Rebuild? [y/N] " -n 1 -r
         echo
         [[ ! $REPLY =~ ^[Yy]$ ]] && return 0
@@ -137,121 +195,252 @@ build_disk_image() {
     cd "${RESOURCES_DIR}/src/x86-ubuntu-gpu-ml"
     ./build.sh
 
-    if [ ! -f "$DISK_IMAGE" ]; then
-        error "Disk image build failed"
-    fi
-
-    info "Disk image built: $DISK_IMAGE"
-    info "Kernel extracted: $KERNEL"
+    [ -f "$DISK_IMAGE" ] || error "Disk image build failed"
+    info "Disk image: $DISK_IMAGE"
+    info "Kernel:     $KERNEL"
 }
 
 # ==========================
-# Step 4: Build GPU test app
+# Build GPU test app
 # ==========================
 build_gpu_app() {
-    info "Building GPU test application (square)..."
+    local app_name="${1:-square}"
+    local app_src="${RESOURCES_DIR}/src/gpu/${app_name}"
+    local app_bin="${app_src}/bin.default/${app_name}.default"
 
-    if [ -f "$SQUARE_APP" ]; then
-        info "Square app already exists: $SQUARE_APP"
+    info "Building GPU app: ${app_name}..."
+
+    [ -d "$app_src" ] || error "App source not found: $app_src"
+
+    if [ -f "$app_bin" ]; then
+        info "App already built: $app_bin"
         return 0
     fi
 
-    cd "${RESOURCES_DIR}/src/gpu/square"
-
     if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
-        info "Using Docker to build..."
-        docker run --rm -u "$(id -u):$(id -g)" \
-            -v "$PWD:$PWD" -w "$PWD" \
-            ghcr.io/gem5/gpu-fs make -f Makefile.default
+        info "Building via Docker (${GPU_APP_BUILD_IMAGE})..."
+        docker run --rm \
+            -u "$(id -u):$(id -g)" \
+            -v "${app_src}:${app_src}" \
+            -w "${app_src}" \
+            "$GPU_APP_BUILD_IMAGE" \
+            make -f Makefile.default
     elif command -v hipcc >/dev/null; then
-        info "Using local hipcc to build..."
-        make -f Makefile.default
+        info "Building with local hipcc..."
+        make -C "$app_src" -f Makefile.default
     else
-        error "Need either Docker or hipcc (ROCm) to build GPU apps"
+        error "Need Docker or hipcc (ROCm) to build GPU apps"
     fi
 
-    if [ ! -f "$SQUARE_APP" ]; then
-        error "GPU app build failed"
-    fi
-    info "GPU app built: $SQUARE_APP"
+    [ -f "$app_bin" ] || error "GPU app build failed"
+    info "GPU app built: $app_bin"
 }
 
 # ==========================
-# Step 5: Run simulation
+# Run: stdlib config
 # ==========================
 run_simulation() {
-    local app="${1:-$SQUARE_APP}"
-    local cpu_type="${2:-X86KvmCPU}"
+    local app="${1:-}"
 
-    info "Running MI300X full-system simulation"
-    info "  CPU type: $cpu_type"
-    info "  App: $app"
+    info "Running MI300X FS simulation (stdlib config)"
 
-    [ -f "$GEM5_BIN" ] || error "gem5 not built. Run: $0 build-gem5"
-    [ -f "$DISK_IMAGE" ] || error "Disk image not found. Run: $0 build-disk"
-    [ -f "$KERNEL" ] || error "Kernel not found. Run: $0 build-disk"
-    [ -f "$app" ] || error "App not found: $app"
+    [ -f "$GEM5_BIN" ]   || error "gem5 not built. Run: $0 build-gem5"
+    [ -f "$STDLIB_CONFIG" ] || error "Config missing: $STDLIB_CONFIG"
+    [ -f "$DISK_IMAGE" ] || error "Disk image missing. Run: $0 build-disk"
+    [ -f "$KERNEL" ]     || error "Kernel missing. Run: $0 build-disk"
+    check_kvm            || error "KVM required. The stdlib config uses KvmCPU."
 
-    if [ "$cpu_type" = "X86KvmCPU" ]; then
-        check_kvm || error "KVM required for X86KvmCPU. Use: $0 run-atomic [app]"
+    local app_args=()
+    if [ -n "$app" ]; then
+        [ -f "$app" ] || error "App not found: $app. Run: $0 build-app"
+        info "  App: $app"
+        app_args=("--app" "$(to_container_path "$app")")
+    else
+        info "  No GPU app specified, booting guest Linux only"
     fi
 
     cd "$GEM5_DIR"
+    info "Starting gem5 via Docker... (output: m5out/system.pc.com_1.device)"
 
-    # Method 1: Using gem5 stdlib config (recommended)
-    info "Starting gem5... Output will appear in m5out/system.pc.com_1.device"
-    "$GEM5_BIN" \
-        configs/example/gem5_library/x86-mi300x-gpu.py \
-        --image "$DISK_IMAGE" \
-        --kernel "$KERNEL" \
-        --app "$app"
+    run_gem5_docker \
+        "$(to_container_path "$GEM5_BIN")" \
+        --listener-mode=on \
+        "$(to_container_path "$STDLIB_CONFIG")" \
+        --image "$(to_container_path "$DISK_IMAGE")" \
+        --kernel "$(to_container_path "$KERNEL")" \
+        "${app_args[@]}"
 
-    info "Simulation complete. Output:"
+    info "Simulation complete."
     echo "========================================"
-    cat m5out/system.pc.com_1.device 2>/dev/null || warn "No output file found"
+    cat m5out/system.pc.com_1.device 2>/dev/null || warn "No output file"
     echo "========================================"
 }
 
+# ==========================
+# Run: legacy gpufs/mi300.py
+# ==========================
 run_simulation_legacy() {
     local app="${1:-$SQUARE_APP}"
 
-    info "Running MI300X simulation (legacy config)..."
+    info "Running MI300X FS simulation (legacy config)"
+    info "  App: $app"
 
-    [ -f "$GEM5_BIN" ] || error "gem5 not built"
-    [ -f "$DISK_IMAGE" ] || error "Disk image not found"
-    [ -f "$KERNEL" ] || error "Kernel not found"
-    [ -f "$app" ] || error "App not found: $app"
-    check_kvm || error "KVM required"
+    [ -f "$GEM5_BIN" ]   || error "gem5 not built. Run: $0 build-gem5"
+    [ -f "$LEGACY_CONFIG" ] || error "Config missing: $LEGACY_CONFIG"
+    [ -f "$DISK_IMAGE" ] || error "Disk image missing. Run: $0 build-disk"
+    [ -f "$KERNEL" ]     || error "Kernel missing. Run: $0 build-disk"
+    [ -f "$app" ]        || error "App not found: $app. Run: $0 build-app"
+    check_kvm            || error "KVM required. Legacy config uses X86KvmCPU."
 
     cd "$GEM5_DIR"
+    info "Starting gem5 via Docker..."
 
-    "$GEM5_BIN" \
-        configs/example/gpufs/mi300.py \
-        --disk-image "$DISK_IMAGE" \
-        --kernel "$KERNEL" \
-        --app "$app"
+    run_gem5_docker \
+        "$(to_container_path "$GEM5_BIN")" \
+        --listener-mode=on \
+        "$(to_container_path "$LEGACY_CONFIG")" \
+        --disk-image "$(to_container_path "$DISK_IMAGE")" \
+        --kernel "$(to_container_path "$KERNEL")" \
+        -a "$(to_container_path "$app")"
+}
+
+# ==========================
+# Status
+# ==========================
+show_status() {
+    echo "=== gem5 MI300X FS Status ==="
+    echo ""
+
+    # gem5 binary
+    if [ -f "$GEM5_BIN" ]; then
+        info "gem5 binary:     $GEM5_BIN"
+    else
+        warn "gem5 binary:     MISSING (run: $0 build-gem5)"
+    fi
+
+    # gem5-resources
+    if [ -d "$RESOURCES_DIR" ]; then
+        info "gem5-resources:  $RESOURCES_DIR"
+    else
+        warn "gem5-resources:  MISSING (run: $0 build-all)"
+    fi
+
+    # Disk image
+    if [ -f "$DISK_IMAGE" ]; then
+        local size
+        size="$(du -h "$DISK_IMAGE" | cut -f1)"
+        info "Disk image:      $DISK_IMAGE (${size})"
+    else
+        warn "Disk image:      MISSING (run: $0 build-disk)"
+    fi
+
+    # Kernel
+    if [ -f "$KERNEL" ]; then
+        info "Kernel:          $KERNEL"
+    else
+        warn "Kernel:          MISSING (run: $0 build-disk)"
+    fi
+
+    # Square app
+    if [ -f "$SQUARE_APP" ]; then
+        info "Square app:      $SQUARE_APP"
+    else
+        warn "Square app:      MISSING (run: $0 build-app)"
+    fi
+
+    echo ""
+    echo "=== Environment ==="
+
+    # KVM
+    check_kvm 2>/dev/null || true
+
+    # Docker
+    if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
+        info "Docker:          running"
+        # Check for build images
+        if docker image inspect "$GEM5_BUILD_IMAGE" >/dev/null 2>&1; then
+            info "  Build image:   $GEM5_BUILD_IMAGE"
+        else
+            warn "  Build image:   $GEM5_BUILD_IMAGE (not pulled)"
+        fi
+        if docker image inspect "$GPU_APP_BUILD_IMAGE" >/dev/null 2>&1; then
+            info "  GPU app image: $GPU_APP_BUILD_IMAGE"
+        else
+            warn "  GPU app image: $GPU_APP_BUILD_IMAGE (not pulled)"
+        fi
+    elif command -v docker >/dev/null; then
+        warn "Docker:          installed but daemon not running"
+    else
+        warn "Docker:          not installed"
+    fi
+
+    # QEMU
+    if [ -f "$QEMU_BIN" ]; then
+        info "QEMU binary:     $QEMU_BIN"
+    elif [ -d "$QEMU_DIR" ]; then
+        warn "QEMU binary:     NOT BUILT (run: $0 build-qemu)"
+        info "  QEMU source:   $QEMU_DIR"
+    else
+        warn "QEMU source:     not found at $QEMU_DIR"
+    fi
 }
 
 # ==========================
 # Main
 # ==========================
+usage() {
+    cat <<USAGE
+gem5 MI300X Full-System GPU Simulation
+
+Commands:
+  build-gem5         Build gem5 (VEGA_X86) via Docker
+  build-qemu         Build QEMU (x86_64-softmmu, with mi300x-gem5 device)
+  build-disk         Build disk image (Ubuntu 22.04 + ROCm)
+  build-app [name]   Build GPU test app (default: square)
+  build-all          Full setup: gem5 + QEMU + disk image + GPU app
+  run [app]          Run with stdlib config (x86-mi300x-gpu.py)
+  run-legacy [app]   Run with legacy config (gpufs/mi300.py)
+  status             Show build status
+
+Environment variables:
+  GEM5_BUILD_IMAGE   Docker image for gem5 build
+                     (default: $GEM5_BUILD_IMAGE)
+  GPU_APP_BUILD_IMAGE  Docker image for GPU app build
+                     (default: $GPU_APP_BUILD_IMAGE)
+
+Layout:
+  gem5 source:       $GEM5_DIR
+  QEMU source:       $QEMU_DIR
+  gem5-resources:    $RESOURCES_DIR
+  Disk image:        $DISK_IMAGE
+  Kernel:            $KERNEL
+  Square app:        $SQUARE_APP
+
+Quick start:
+  $0 build-all
+  $0 run
+USAGE
+}
+
 main() {
     local cmd="${1:-help}"
     shift || true
 
-    check_prerequisites
-
     case "$cmd" in
         build-all)
             build_gem5
+            build_qemu
             get_resources
             build_disk_image
-            build_gpu_app
-            info "All components built successfully!"
-            info "Run simulation: $0 run"
+            build_gpu_app "${1:-square}"
+            info "All components built!"
+            info "Run: $0 run"
             ;;
         build-gem5)
             build_gem5
+            ;;
+        build-qemu)
+            build_qemu
             ;;
         build-disk)
             get_resources
@@ -259,52 +448,19 @@ main() {
             ;;
         build-app)
             get_resources
-            build_gpu_app
+            build_gpu_app "${1:-square}"
             ;;
         run)
-            run_simulation "${1:-$SQUARE_APP}" "X86KvmCPU"
-            ;;
-        run-atomic)
-            warn "AtomicSimpleCPU mode: ~100x slower than KVM"
-            run_simulation "${1:-$SQUARE_APP}" "AtomicSimpleCPU"
+            run_simulation "${1:-}"
             ;;
         run-legacy)
             run_simulation_legacy "${1:-$SQUARE_APP}"
             ;;
         status)
-            echo "=== gem5 MI300X FS Status ==="
-            [ -f "$GEM5_BIN" ] && info "gem5 binary: OK" || warn "gem5 binary: MISSING"
-            [ -d "$RESOURCES_DIR" ] && info "gem5-resources: OK" || warn "gem5-resources: MISSING"
-            [ -f "$DISK_IMAGE" ] && info "Disk image: OK" || warn "Disk image: MISSING"
-            [ -f "$KERNEL" ] && info "Kernel: OK" || warn "Kernel: MISSING"
-            [ -f "$SQUARE_APP" ] && info "Square app: OK" || warn "Square app: MISSING"
-            check_kvm || true
+            show_status
             ;;
         help|*)
-            cat <<'USAGE'
-gem5 MI300X Full-System GPU Simulation
-
-Commands:
-  build-all      Full setup: gem5 + disk image + GPU app
-  build-gem5     Build gem5 (VEGA_X86) only
-  build-disk     Build disk image (Ubuntu 24.04 + ROCm 7.0)
-  build-app      Build GPU test application (square)
-  run [app]      Run simulation with KVM CPU
-  run-atomic [app]  Run simulation without KVM (very slow)
-  run-legacy [app]  Run with legacy gpufs/mi300.py config
-  status         Show build status
-
-Requirements:
-  - x86_64 Linux host
-  - /dev/kvm (for run and build-disk)
-  - qemu-system-x86_64 (for build-disk)
-  - Docker (for build-app)
-  - ~60GB free disk space
-
-Quick start:
-  ./scripts/run_mi300x_fs.sh build-all
-  ./scripts/run_mi300x_fs.sh run
-USAGE
+            usage
             ;;
     esac
 }

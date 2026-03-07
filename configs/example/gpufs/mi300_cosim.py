@@ -1,68 +1,44 @@
 # Copyright (c) 2024 The gem5 Contributors
 # All rights reserved.
-#
-# Redistribution and use in source and binary forms, with or without
-# modification, are permitted provided that the following conditions are met:
-#
-# 1. Redistributions of source code must retain the above copyright notice,
-# this list of conditions and the following disclaimer.
-#
-# 2. Redistributions in binary form must reproduce the above copyright notice,
-# this list of conditions and the following disclaimer in the documentation
-# and/or other materials provided with the distribution.
-#
-# 3. Neither the name of the copyright holder nor the names of its
-# contributors may be used to endorse or promote products derived from this
-# software without specific prior written permission.
-#
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
-# POSSIBILITY OF SUCH DAMAGE.
+# SPDX-License-Identifier: BSD-3-Clause
 
 """MI300X co-simulation configuration for QEMU + gem5.
 
-This script starts gem5 with a full MI300X GPU model (compute units, SDMA
-engines, PM4 command processors, memory hierarchy) and a co-simulation
-socket bridge (MI300XGem5Cosim).  The HOST side (CPU, kernel, ROCm driver)
-runs inside QEMU with a Q35 chipset, and QEMU's "mi300x-gem5" PCIe device
-forwards MMIO/Doorbell/DMA over a Unix domain socket to this gem5 process.
+Builds a minimal gem5 system with ONLY the MI300X GPU model (no x86
+kernel, no CPU execution).  QEMU handles all host-side simulation
+(CPU, kernel boot, PCI enumeration, ROCm driver); gem5 provides
+the GPU compute back-end via a Unix domain socket bridge.
 
-Shared Memory Architecture:
-    QEMU and gem5 share two POSIX shared memory regions:
-    1. Host RAM (/dev/shm/cosim-guest-ram) - Guest physical memory shared
-       between QEMU's KVM and gem5's DMA engines (HSAPP, GCP, IH, SDMA).
-       This allows GPU DMA reads/writes to directly access guest memory.
-    2. VRAM (/dev/shm/mi300x-vram) - GPU device memory shared between
-       QEMU's driver writes and gem5's shader execution.
+Architecture:
+    QEMU (guest Linux + amdgpu driver)
+        |  Unix domain socket (MMIO, doorbell, DMA, IRQ)
+        v
+    MI300XGem5Cosim (this config, in gem5)
+        |  forward via AMDGPUDevice read/write
+        v
+    AMDGPUDevice + Shader + Ruby GPU hierarchy
+
+Shared memory:
+    /dev/shm/cosim-guest-ram  - guest physical memory (QEMU + gem5 DMA)
+    /dev/shm/mi300x-vram      - GPU VRAM (QEMU driver + gem5 shader)
 
 Usage:
     # Terminal 1 - start gem5 (waits for QEMU to connect):
-    build/VEGA_X86/gem5.opt configs/example/gpufs/mi300_cosim.py \\
-        --socket-path /tmp/gem5-mi300x.sock \\
-        --shmem-path  /mi300x-vram \\
+    build/VEGA_X86/gem5.opt configs/example/gpufs/mi300_cosim.py \
+        --socket-path /tmp/gem5-mi300x.sock \
+        --shmem-path /mi300x-vram \
         --shmem-host-path /cosim-guest-ram
 
-    # Terminal 2 - start QEMU (connects to gem5, with shared memory):
-    qemu-system-x86_64 -machine q35 -enable-kvm -smp 4 \\
-        -object memory-backend-file,id=mem0,size=8G,\\
-                mem-path=/dev/shm/cosim-guest-ram,share=on \\
-        -numa node,memdev=mem0 \\
-        -device mi300x-gem5,gem5-socket=/tmp/gem5-mi300x.sock,\\
-                shmem-path=/dev/shm/mi300x-vram \\
-        -drive file=disk-image.qcow2,format=qcow2 \\
-        -kernel vmlinux-gpu-ml \\
-        -append "console=ttyS0 root=/dev/sda1" \\
+    # Terminal 2 - start QEMU:
+    qemu-system-x86_64 -machine q35 -enable-kvm -smp 4 -m 8G \
+        -object memory-backend-file,id=mem0,size=8G,\
+                mem-path=/dev/shm/cosim-guest-ram,share=on \
+        -numa node,memdev=mem0 \
+        -device mi300x-gem5,gem5-socket=/tmp/gem5-mi300x.sock,\
+                shmem-path=/dev/shm/mi300x-vram \
+        -drive file=disk-image,format=raw,if=virtio \
+        -kernel vmlinux -append "console=ttyS0 root=/dev/vda1" \
         -nographic
-
-See scripts/cosim_launch.sh for a helper that starts both processes.
 """
 
 import argparse
@@ -70,7 +46,10 @@ import math
 
 import m5
 from m5.objects import *
-from m5.util import addToPath
+from m5.util import (
+    addToPath,
+    convert,
+)
 
 addToPath("../../")
 from amd import AmdGPUOptions
@@ -80,9 +59,12 @@ from common import (
     ObjectList,
     Options,
 )
-from ruby import Ruby
-
 from example.gpufs.Disjoint_VIPER import *
+from ruby import Ruby
+from system.amdgpu import (
+    connectGPU,
+    createGPU,
+)
 
 
 def addCosimOptions(parser):
@@ -99,251 +81,94 @@ def addCosimOptions(parser):
         help="POSIX shared memory name for VRAM (e.g. /mi300x-vram)",
     )
     parser.add_argument(
-        "--dgpu-mem-size",
-        type=str,
-        default="16GiB",
-        help="dGPU memory size",
-    )
-    parser.add_argument(
-        "--dgpu-num-dirs",
-        type=int,
-        default=1,
-        help="Number of dGPU directories (memory controllers)",
-    )
-    parser.add_argument(
-        "--dgpu-mem-type",
-        default="HBM_1000_4H_1x128",
-        choices=ObjectList.mem_list.get_names(),
-        help="Type of dGPU memory",
-    )
-    parser.add_argument(
-        "--gpu-device",
-        default="MI300X",
-        choices=["MI300X", "MI355X"],
-        help="GPU model (MI300X=gfx942, MI355X=gfx950)",
-    )
-    parser.add_argument(
-        "--gpu-topology",
-        type=str,
-        default="Crossbar",
-        help="Network topology for GPU side",
-    )
-    parser.add_argument(
         "--shmem-host-path",
         type=str,
         default="/cosim-guest-ram",
-        help="POSIX shared memory name for host (guest) RAM "
-        "(e.g. /cosim-guest-ram). QEMU must be configured with "
-        "-object memory-backend-file,mem-path=/dev/shm/cosim-guest-ram,"
-        "share=on to share guest RAM with gem5.",
+        help="POSIX shared memory name for host (guest) RAM",
     )
 
 
 def buildCosimSystem(args):
-    """Build a minimal gem5 system with the MI300X GPU model and cosim bridge.
+    """Build a minimal gem5 GPU-only system for cosimulation with QEMU.
 
-    Unlike the standard GPUFS config (mi300.py), this does NOT create a
-    full x86 host system.  Instead, it creates:
-      - A minimal System with the Ruby GPU memory hierarchy
-      - The AMDGPUDevice with all its IP blocks (SDMA, PM4, IH, CU, etc.)
-      - An MI300XGem5Cosim bridge listening on a Unix socket
-    QEMU provides the host CPU, kernel, and amdgpu driver.
+    No kernel, no x86 workload — just the MI300X GPU model with PCI
+    infrastructure (Pc platform) and Ruby GPU cache hierarchy.
+    QEMU handles all host-side simulation.
     """
 
-    # ----------------------------------------------------------------
-    # System skeleton
-    # ----------------------------------------------------------------
-    system = System()
-    system.mem_mode = "atomic_noncaching"
-    system.cache_line_size = args.cacheline_size
-
-    system.voltage_domain = VoltageDomain(voltage=args.sys_voltage)
-    system.clk_domain = SrcClockDomain(
-        clock=args.sys_clock, voltage_domain=system.voltage_domain
-    )
-
-    # We still need a memory bus for DMA devices
-    system.membus = SystemXBar()
-
-    # Host memory range (for DMA from GPU to guest RAM via cosim bridge).
-    # Use shared backstore so QEMU and gem5 share the same physical memory.
-    # QEMU must be configured with:
-    #   -object memory-backend-file,id=mem0,size=8G,
-    #           mem-path=/dev/shm/cosim-guest-ram,share=on
-    #   -numa node,memdev=mem0
-    system.shared_backstore = args.shmem_host_path
-    system.auto_unlink_shared_backstore = True
-    system.mem_ranges = [AddrRange(args.mem_size)]
-    system.memories = [SimpleMemory(range=system.mem_ranges[0])]
-    system.memories[0].port = system.membus.mem_side_ports
-
-    # IO bus for PIO devices
-    system.iobus = IOXBar()
-    system.bridge = Bridge(delay="50ns")
-    system.bridge.mem_side_port = system.iobus.cpu_side_ports
-    system.bridge.cpu_side_port = system.membus.mem_side_ports
-    system.bridge.ranges = [
-        AddrRange(0xC0000000, size="256MiB"),  # PCI config space
-        AddrRange(0xE0000000, size="256MiB"),  # HSAPP map area
-    ]
-
-    # ----------------------------------------------------------------
-    # GPU shader (compute units)
-    # ----------------------------------------------------------------
     n_cu = args.num_compute_units
     args.num_sqc = int(math.ceil(float(n_cu) / args.cu_per_sqc))
     args.num_scalar_cache = int(
         math.ceil(float(n_cu) / args.cu_per_scalar_cache)
     )
 
-    shader = Shader(
-        n_wf=args.wfs_per_simd,
-        cu_per_sqc=args.cu_per_sqc,
-        timing=True,
-        clk_domain=system.clk_domain,
+    # Minimal system — StubWorkload by default, no kernel needed
+    system = System()
+    system.mem_mode = "atomic_noncaching"
+    system.m5ops_base = 0xFFFF0000
+
+    # Memory ranges — must match QEMU Q35's memory split so that the
+    # shared_backstore file offsets agree.  Q35 places the PCI hole at
+    # 2 GiB when total RAM >= 2.75 GiB, otherwise at 2.75 GiB.
+    # See qemu/hw/i386/pc_q35.c q35_machine_init().
+    total_mem = convert.toMemorySize(args.mem_size)
+    lowmem_limit = (
+        0x80000000  # 2 GiB — Q35 with large RAM
+        if total_mem >= 0xB0000000  # 2.75 GiB threshold
+        else 0xB0000000  # 2.75 GiB — Q35 with small RAM
     )
-    shader.impl_kern_launch_acq = True
-    shader.impl_kern_end_rel = False
+    below_4g = min(total_mem, lowmem_limit)
+    above_4g = total_mem - below_4g
 
-    per_lane = args.TLB_config == "perLane"
+    if above_4g > 0:
+        system.mem_ranges = [
+            AddrRange(below_4g),
+            AddrRange(Addr("4GiB"), size=above_4g),
+        ]
+    else:
+        system.mem_ranges = [AddrRange(total_mem)]
 
-    compute_units = []
-    for i in range(n_cu):
-        compute_units.append(
-            ComputeUnit(
-                cu_id=i,
-                perLaneTLB=per_lane,
-                num_SIMDs=args.simds_per_cu,
-                wf_size=args.wf_size,
-                spbypass_pipe_length=args.sp_bypass_path_length,
-                dpbypass_pipe_length=args.dp_bypass_path_length,
-                issue_period=args.issue_period,
-                coalescer_to_vrf_bus_width=args.glbmem_rd_bus_width,
-                vrf_to_coalescer_bus_width=args.glbmem_wr_bus_width,
-                num_global_mem_pipes=args.glb_mem_pipes_per_cu,
-                num_shared_mem_pipes=args.shr_mem_pipes_per_cu,
-                n_wf=args.wfs_per_simd,
-                execPolicy=args.CUExecPolicy,
-                localMemBarrier=args.LocalMemBarrier,
-                countPages=args.countPages,
-                memtime_latency=args.memtime_latency,
-                max_cu_tokens=args.max_cu_tokens,
-                vrf_lm_bus_latency=args.vrf_lm_bus_latency,
-                mem_req_latency=args.mem_req_latency,
-                mem_resp_latency=args.mem_resp_latency,
-                scalar_mem_req_latency=args.scalar_mem_req_latency,
-                scalar_mem_resp_latency=args.scalar_mem_resp_latency,
-                mfma_scale=args.mfma_scale,
-                localDataStore=LdsState(
-                    banks=args.numLdsBanks,
-                    bankConflictPenalty=args.ldsBankConflictPenalty,
-                    size=args.lds_size,
-                ),
-            )
-        )
+    # Share host memory with QEMU via POSIX shared memory
+    system.shared_backstore = args.shmem_host_path
+    system.auto_unlink_shared_backstore = True
 
-        wavefronts = []
-        vrfs = []
-        vrf_pool_mgrs = []
-        srfs = []
-        rfcs = []
-        srf_pool_mgrs = []
-        for j in range(args.simds_per_cu):
-            for k in range(shader.n_wf):
-                wavefronts.append(
-                    Wavefront(simdId=j, wf_slot_id=k, wf_size=args.wf_size)
-                )
-            if args.reg_alloc_policy == "simple":
-                vrf_pool_mgrs.append(
-                    SimplePoolManager(
-                        pool_size=args.vreg_file_size,
-                        min_alloc=args.vreg_min_alloc,
-                    )
-                )
-                srf_pool_mgrs.append(
-                    SimplePoolManager(
-                        pool_size=args.sreg_file_size,
-                        min_alloc=args.vreg_min_alloc,
-                    )
-                )
-            elif args.reg_alloc_policy == "dynamic":
-                vrf_pool_mgrs.append(
-                    DynPoolManager(
-                        pool_size=args.vreg_file_size,
-                        min_alloc=args.vreg_min_alloc,
-                    )
-                )
-                srf_pool_mgrs.append(
-                    DynPoolManager(
-                        pool_size=args.sreg_file_size,
-                        min_alloc=args.vreg_min_alloc,
-                    )
-                )
+    # PCI infrastructure (Pc provides PciBus → PciUpstream for AMDGPUDevice)
+    system.pc = Pc()
 
-            vrfs.append(
-                VectorRegisterFile(
-                    simd_id=j,
-                    wf_size=args.wf_size,
-                    num_regs=args.vreg_file_size,
-                )
-            )
-            srfs.append(
-                ScalarRegisterFile(
-                    simd_id=j,
-                    wf_size=args.wf_size,
-                    num_regs=args.sreg_file_size,
-                )
-            )
-            rfcs.append(
-                RegisterFileCache(
-                    simd_id=j, cache_size=args.register_file_cache_size
-                )
-            )
+    # Disable SouthBridge timer events — cosim doesn't need them, and they
+    # advance curTick until it overflows, crashing the event scheduler.
+    system.pc.south_bridge.cmos.disable_rtc_events = True
+    system.pc.south_bridge.pit.disable_timer_events = True
 
-        compute_units[-1].wavefronts = wavefronts
-        compute_units[-1].vector_register_file = vrfs
-        compute_units[-1].scalar_register_file = srfs
-        compute_units[-1].register_file_cache = rfcs
-        compute_units[-1].register_manager = RegisterManager(
-            policy=args.registerManagerPolicy,
-            vrf_pool_managers=vrf_pool_mgrs,
-            srf_pool_managers=srf_pool_mgrs,
-        )
+    # Clock domains
+    system.voltage_domain = VoltageDomain(voltage=args.sys_voltage)
+    system.clk_domain = SrcClockDomain(
+        clock=args.sys_clock, voltage_domain=system.voltage_domain
+    )
+    system.cpu_voltage_domain = VoltageDomain()
+    system.cpu_clk_domain = SrcClockDomain(
+        clock=args.cpu_clock, voltage_domain=system.cpu_voltage_domain
+    )
 
-        compute_units[-1].ldsPort = compute_units[-1].ldsBus.cpu_side_port
-        compute_units[-1].ldsBus.mem_side_port = (
-            compute_units[-1].localDataStore.cuPort
-        )
+    # Bus setup (mirrors connectX86RubySystem)
+    system.iobus = IOXBar()
+    system._dma_ports = [system.pc.pci_host.up_request_port()]
+    system.pc.attachIO(system.iobus, system._dma_ports)
 
-    shader.CUs = compute_units
-    shader.eventq_index = 0
+    # Minimal dummy CPU — Shader needs cpu_pointer, Ruby needs CPU ports.
+    # In cosim mode QEMU handles all CPU work; this CPU is structural only.
+    system.cpu = [AtomicSimpleCPU(clk_domain=system.cpu_clk_domain, cpu_id=0)]
 
-    # ----------------------------------------------------------------
-    # AMD GPU device
-    # ----------------------------------------------------------------
-    gpu_dev = AMDGPUDevice(pci_func=0, pci_dev=8)
-    gpu_dev.device_name = args.gpu_device
+    # Create GPU shader and device using standard helpers
+    shader = createGPU(system, args)
+    connectGPU(system, args)
 
-    if args.gpu_device == "MI300X":
-        gpu_dev.DeviceID = 0x74A1
-        gpu_dev.BAR5 = PciMemBar(size="2MiB")
-    elif args.gpu_device == "MI355X":
-        gpu_dev.DeviceID = 0x75A0
-        gpu_dev.BAR5 = PciMemBar(size="2MiB")
+    # Share VRAM backing store with QEMU
+    system.pc.south_bridge.gpu.vram_shared_backstore = args.shmem_path
 
-    # Share VRAM backing store with QEMU via POSIX shared memory.
-    # This allows both QEMU (driver side) and gem5 (shader side) to
-    # see the same VRAM contents (kernel code, data buffers, etc.).
-    gpu_dev.vram_shared_backstore = args.shmem_path
-
-    gpu_dev.SubsystemVendorID = 0x1002
-    gpu_dev.SubsystemID = 0x0C34
-    gpu_dev.Status = 0x0290
-    gpu_dev.PXCAPBaseOffset = 0x80
-    gpu_dev.CapabilityPtr = 0x80
-    gpu_dev.PXCAPCapId = 0x10
-    gpu_dev.PXCAPDevCap2 = 0x00000180
-    gpu_dev.PXCAPDevCtrl2 = 0x0040
+    # The shader is appended as a "CPU" (needed by GPUTLBConfig)
+    shader_idx = args.num_cpus
+    system.cpu.append(shader)
 
     # HSA Packet Processor
     hsapp_gpu_map_paddr = 0xE0000000
@@ -353,7 +178,6 @@ def buildCosimSystem(args):
         numHWQueues=args.num_hw_queues,
         walker=hsapp_pt_walker,
     )
-
     dispatcher = GPUDispatcher()
     cp_pt_walker = VegaPagetableWalker()
     gpu_cmd_proc = GPUCommandProcessor(
@@ -363,22 +187,33 @@ def buildCosimSystem(args):
     )
     shader.dispatcher = dispatcher
     shader.gpu_cmd_proc = gpu_cmd_proc
-    gpu_dev.cp = gpu_cmd_proc
+    system.pc.south_bridge.gpu.cp = gpu_cmd_proc
 
     # GPU Interrupt Handler
     device_ih = AMDGPUInterruptHandler()
-    gpu_dev.device_ih = device_ih
+    system.pc.south_bridge.gpu.device_ih = device_ih
 
-    # SDMA engines (MI300X has 16)
+    # SDMA engines (MI300X: 16)
     sdma_bases = [
-        0x4980, 0x6180, 0x65000, 0x66000,
-        0x84980, 0x86180, 0xE5000, 0xE6000,
-        0x104980, 0x106180, 0x165000, 0x166000,
-        0x184980, 0x186180, 0x1E5000, 0x1E6000,
+        0x4980,
+        0x6180,
+        0x65000,
+        0x66000,
+        0x84980,
+        0x86180,
+        0xE5000,
+        0xE6000,
+        0x104980,
+        0x106180,
+        0x165000,
+        0x166000,
+        0x184980,
+        0x186180,
+        0x1E5000,
+        0x1E6000,
     ]
     num_sdmas = 16
     sdma_sizes = [0x1000] * num_sdmas
-
     sdma_pt_walkers = []
     sdma_engines = []
     for idx in range(num_sdmas):
@@ -390,16 +225,19 @@ def buildCosimSystem(args):
         )
         sdma_pt_walkers.append(w)
         sdma_engines.append(e)
+    system.pc.south_bridge.gpu.sdmas = sdma_engines
 
-    gpu_dev.sdmas = sdma_engines
-
-    # PM4 packet processors (8 for MI300X / MI355X)
+    # PM4 packet processors (8)
     pm4_procs = []
     pm4_ranges = [
-        (0xC000, 0xD000), (0x4C000, 0x4D000),
-        (0x8C000, 0x8D000), (0xCC000, 0xCD000),
-        (0x10C000, 0x10D000), (0x14C000, 0x14D000),
-        (0x18C000, 0x18D000), (0x1CC000, 0x1CD000),
+        (0xC000, 0xD000),
+        (0x4C000, 0x4D000),
+        (0x8C000, 0x8D000),
+        (0xCC000, 0xCD000),
+        (0x10C000, 0x10D000),
+        (0x14C000, 0x14D000),
+        (0x18C000, 0x18D000),
+        (0x1CC000, 0x1CD000),
     ]
     for ip_id, (start, end) in enumerate(pm4_ranges):
         pm4_procs.append(
@@ -408,24 +246,18 @@ def buildCosimSystem(args):
                 mmio_range=AddrRange(start=start, end=end),
             )
         )
-    gpu_dev.pm4_pkt_procs = pm4_procs
+    system.pc.south_bridge.gpu.pm4_pkt_procs = pm4_procs
 
-    # GPU memory manager
+    # GPU memory manager and system hub
     gpu_mem_mgr = AMDGPUMemoryManager(cache_line_size=args.cacheline_size)
-    gpu_dev.memory_manager = gpu_mem_mgr
-
-    # CPU-side system hub
+    system.pc.south_bridge.gpu.memory_manager = gpu_mem_mgr
     system_hub = AMDGPUSystemHub()
     shader.system_hub = system_hub
 
-    # ----------------------------------------------------------------
-    # Wire up the GPU to the system
-    # ----------------------------------------------------------------
-    system.gpu_dev = gpu_dev
-    system.shader = shader
+    # Attach GPU to PCI bus
+    system.pc.attachPciDevice(system.pc.south_bridge.gpu)
 
     # DMA ports
-    system._dma_ports = []
     system._dma_ports.append(gpu_hsapp)
     system._dma_ports.append(gpu_cmd_proc)
     for sdma in sdma_engines:
@@ -452,9 +284,9 @@ def buildCosimSystem(args):
 
     # TLB hierarchy
     args.full_system = True
-    shader_idx = 0  # shader is the only "CPU" in this config
-    system.cpu = [shader]
-    GPUTLBConfig.config_tlb_hierarchy(args, system, shader_idx, gpu_dev, True)
+    GPUTLBConfig.config_tlb_hierarchy(
+        args, system, shader_idx, system.pc.south_bridge.gpu, True
+    )
 
     # Ruby GPU memory hierarchy (disjoint VIPER)
     system.ruby = Disjoint_VIPER()
@@ -463,7 +295,15 @@ def buildCosimSystem(args):
         clock=args.ruby_clock, voltage_domain=system.voltage_domain
     )
 
-    # Connect shader ports to Ruby
+    # Wire CPU ports
+    for i in range(args.num_cpus):
+        cpu = system.cpu[i]
+        cpu.clk_domain = system.cpu_clk_domain
+        cpu.createThreads()
+        cpu.createInterruptController()
+        system.ruby._cpu_ports[i].connectCpuPorts(cpu)
+
+    # Wire GPU ports to Ruby
     gpu_port_idx = (
         len(system.ruby._cpu_ports)
         - n_cu
@@ -475,14 +315,14 @@ def buildCosimSystem(args):
     token_port_idx = 0
     for i in range(len(system.ruby._cpu_ports)):
         if isinstance(system.ruby._cpu_ports[i], VIPERCoalescer):
-            shader.CUs[token_port_idx].gmTokenPort = (
+            system.cpu[shader_idx].CUs[token_port_idx].gmTokenPort = (
                 system.ruby._cpu_ports[i].gmTokenPort
             )
             token_port_idx += 1
 
     for i in range(n_cu):
         for j in range(args.wf_size):
-            shader.CUs[i].memory_port[j] = (
+            system.cpu[shader_idx].CUs[i].memory_port[j] = (
                 system.ruby._cpu_ports[gpu_port_idx].in_ports[j]
             )
         gpu_port_idx += 1
@@ -490,23 +330,23 @@ def buildCosimSystem(args):
     for i in range(n_cu):
         if i > 0 and not i % args.cu_per_sqc:
             gpu_port_idx += 1
-        shader.CUs[i].sqc_port = (
-            system.ruby._cpu_ports[gpu_port_idx].in_ports
-        )
+        system.cpu[shader_idx].CUs[i].sqc_port = system.ruby._cpu_ports[
+            gpu_port_idx
+        ].in_ports
     gpu_port_idx += 1
 
     for i in range(n_cu):
         if i > 0 and not i % args.cu_per_scalar_cache:
             gpu_port_idx += 1
-        shader.CUs[i].scalar_port = (
-            system.ruby._cpu_ports[gpu_port_idx].in_ports
-        )
+        system.cpu[shader_idx].CUs[i].scalar_port = system.ruby._cpu_ports[
+            gpu_port_idx
+        ].in_ports
 
     # ----------------------------------------------------------------
     # Co-simulation bridge
     # ----------------------------------------------------------------
     system.cosim = MI300XGem5Cosim(
-        gpu_device=gpu_dev,
+        gpu_device=system.pc.south_bridge.gpu,
         socket_path=args.socket_path,
         shmem_path=args.shmem_path,
         vram_size=args.dgpu_mem_size,
@@ -523,17 +363,29 @@ if __name__ == "__m5_main__":
     GPUTLBOptions.tlb_options(parser)
     addCosimOptions(parser)
 
+    # GPU FS options (dgpu-mem-size, gpu-topology, etc.)
+    from example.gpufs.runfs import addRunFSOptions
+
+    addRunFSOptions(parser)
+
     args = parser.parse_args()
 
-    # Defaults for cosim mode
-    args.num_cpus = 0
+    # Cosim defaults — GPU-only, no real CPU execution
+    args.num_cpus = 1
+    args.cpu_type = "AtomicSimpleCPU"
     args.mem_size = "8GiB"
     args.num_compute_units = 40
-    args.gpu_topology = "Crossbar"
+    if not hasattr(args, "gpu_topology") or args.gpu_topology is None:
+        args.gpu_topology = "Crossbar"
+    if not hasattr(args, "cpu_topology") or args.cpu_topology is None:
+        args.cpu_topology = "Crossbar"
+    args.gpu_device = "MI300X"
+    if not hasattr(args, "dgpu_mem_size") or args.dgpu_mem_size is None:
+        args.dgpu_mem_size = "16GiB"
 
     system = buildCosimSystem(args)
 
-    root = Root(full_system=False, system=system)
+    root = Root(full_system=True, system=system)
 
     m5.instantiate()
 
@@ -552,9 +404,11 @@ if __name__ == "__m5_main__":
 
     while True:
         cause = exit_event.getCause()
-        if cause in ("m5_exit instruction encountered",
-                     "user interrupt received",
-                     "simulate() limit reached"):
+        if cause in (
+            "m5_exit instruction encountered",
+            "user interrupt received",
+            "simulate() limit reached",
+        ):
             break
         elif "GPU Kernel Completed" in cause:
             print(f"GPU kernel completed at tick {m5.curTick()}")
