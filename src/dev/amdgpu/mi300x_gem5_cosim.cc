@@ -50,6 +50,7 @@
 #include "mem/packet_access.hh"
 #include "mem/request.hh"
 #include "sim/byteswap.hh"
+#include "sim/sim_exit.hh"
 
 namespace gem5
 {
@@ -395,8 +396,9 @@ MI300XGem5Cosim::handleInit(int fd, const CosimMsgHeader &msg)
 void
 MI300XGem5Cosim::handleShutdown(int fd, const CosimMsgHeader &msg)
 {
-    inform("MI300XGem5Cosim: SHUTDOWN from QEMU");
+    inform("MI300XGem5Cosim: SHUTDOWN from QEMU, exiting simulation");
     closeClient(fd);
+    exitSimLoop("QEMU shutdown request", 0);
 }
 
 void
