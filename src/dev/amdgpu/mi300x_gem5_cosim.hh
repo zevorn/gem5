@@ -43,6 +43,7 @@
 #include "base/types.hh"
 #include "dev/amdgpu/amdgpu_defines.hh"
 #include "params/MI300XGem5Cosim.hh"
+#include "sim/eventq.hh"
 #include "sim/sim_object.hh"
 
 namespace gem5
@@ -227,6 +228,13 @@ class MI300XGem5Cosim : public SimObject
     uint8_t *dmaBuf = nullptr;
 
     bool connected = false;
+
+    // Keepalive event to prevent the event queue from draining.
+    // Without periodic timer devices (RTC/PIT disabled for cosim),
+    // the queue would be empty and m5.simulate() would return immediately.
+    static constexpr Tick KEEPALIVE_INTERVAL = 1000000; // 1 μs in ticks
+    EventFunctionWrapper keepaliveEvent;
+    void processKeepalive();
 };
 
 } // namespace gem5

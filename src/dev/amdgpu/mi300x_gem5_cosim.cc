@@ -59,9 +59,16 @@ MI300XGem5Cosim::MI300XGem5Cosim(const Params &p)
       gpuDevice(p.gpu_device),
       socketPath(p.socket_path),
       shmemPath(p.shmem_path),
-      vramSize(p.vram_size)
+      vramSize(p.vram_size),
+      keepaliveEvent([this] { processKeepalive(); }, name())
 {
     dmaBuf = new uint8_t[COSIM_DMA_BUF_SIZE];
+}
+
+void
+MI300XGem5Cosim::processKeepalive()
+{
+    schedule(keepaliveEvent, curTick() + KEEPALIVE_INTERVAL);
 }
 
 MI300XGem5Cosim::~MI300XGem5Cosim()
@@ -119,6 +126,11 @@ MI300XGem5Cosim::startup()
     if (!shmemPath.empty()) {
         setupSharedMemory();
     }
+
+    // Schedule keepalive to keep the event queue alive.
+    // Without this, m5.simulate() returns immediately when timer devices
+    // (RTC/PIT) are disabled for cosim.
+    schedule(keepaliveEvent, curTick() + KEEPALIVE_INTERVAL);
 }
 
 // ---- Shared Memory ----
@@ -152,6 +164,10 @@ MI300XGem5Cosim::setupSharedMemory()
 
     inform("MI300XGem5Cosim: VRAM shared memory %s mapped at %p (%lu bytes)",
            shmemPath, shmemPtr, (unsigned long)vramSize);
+
+    // Enable GART PTE fallback from shared VRAM in cosim mode
+    gpuDevice->getVM().vramShmemPtr = static_cast<uint8_t *>(shmemPtr);
+    gpuDevice->getVM().vramShmemSize = vramSize;
 }
 
 void
@@ -290,13 +306,22 @@ MI300XGem5Cosim::sendMsg(int fd, const CosimMsgHeader &msg)
 void
 MI300XGem5Cosim::handleClientData(int fd)
 {
-    CosimMsgHeader msg;
-    if (!recvAll(fd, &msg, COSIM_MSG_HDR_SIZE)) {
-        closeClient(fd);
-        return;
-    }
+    // Drain all pending messages. FASYNC/SIGIO is edge-triggered: if
+    // multiple messages arrive before the first is processed, only one
+    // signal fires. We must read all available data to avoid deadlock
+    // (e.g., a fire-and-forget write followed by a blocking read).
+    struct pollfd pfd;
+    do {
+        CosimMsgHeader msg;
+        if (!recvAll(fd, &msg, COSIM_MSG_HDR_SIZE)) {
+            closeClient(fd);
+            return;
+        }
 
-    processMessage(fd, msg);
+        processMessage(fd, msg);
+
+        pfd = {fd, POLLIN, 0};
+    } while (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN));
 }
 
 // ---- Message Processing ----
@@ -381,7 +406,7 @@ MI300XGem5Cosim::handleMmioRead(int fd, const CosimMsgHeader &msg)
     if (accessSize == 0 || accessSize > 8)
         accessSize = 4;
 
-    // QEMU BAR0 (MMIO) -> gem5 MMIO_BAR (BAR5)
+    // QEMU BAR5 (MMIO) -> gem5 readMMIO/writeMMIO (MMIO_BAR=5)
     uint64_t value = gpuMmioRead(msg.addr, accessSize);
 
     DPRINTF(MI300XCosim,
@@ -409,7 +434,7 @@ MI300XGem5Cosim::handleMmioWrite(int fd, const CosimMsgHeader &msg)
             "MMIO Write: addr=0x%lx access_size=%u value=0x%lx\n",
             msg.addr, accessSize, msg.data);
 
-    // QEMU BAR0 (MMIO) -> gem5 MMIO_BAR (BAR5)
+    // QEMU BAR5 (MMIO) -> gem5 readMMIO/writeMMIO (MMIO_BAR=5)
     gpuMmioWrite(msg.addr, accessSize, msg.data);
 
     // MMIO writes are fire-and-forget from QEMU's perspective
@@ -423,7 +448,7 @@ MI300XGem5Cosim::handleDoorbellRead(int fd, const CosimMsgHeader &msg)
     if (accessSize == 0 || accessSize > 8)
         accessSize = 4;
 
-    // QEMU BAR4 (Doorbell) -> gem5 DOORBELL_BAR (BAR2)
+    // QEMU BAR2 (Doorbell) -> gem5 readDoorbell/writeDoorbell (DOORBELL_BAR=2)
     uint64_t value = gpuDoorbellRead(msg.addr, accessSize);
 
     DPRINTF(MI300XCosim,
@@ -451,7 +476,7 @@ MI300XGem5Cosim::handleDoorbellWrite(int fd, const CosimMsgHeader &msg)
             "Doorbell Write: addr=0x%lx access_size=%u value=0x%lx\n",
             msg.addr, accessSize, msg.data);
 
-    // QEMU BAR4 (Doorbell) -> gem5 DOORBELL_BAR (BAR2)
+    // QEMU BAR2 (Doorbell) -> gem5 readDoorbell/writeDoorbell (DOORBELL_BAR=2)
     gpuDoorbellWrite(msg.addr, accessSize, msg.data);
 
     // Doorbell writes are fire-and-forget (QEMU sends NULL response)
@@ -603,9 +628,9 @@ MI300XGem5Cosim::handleFrameWrite(int fd, const CosimMsgHeader &msg)
 // what readDevice/writeDevice do in amdgpu_device.cc.
 //
 // BAR mapping (QEMU -> gem5):
-//   QEMU BAR0 (MMIO)     -> gem5 readMMIO/writeMMIO  (MMIO_BAR=5)
-//   QEMU BAR2 (VRAM)     -> gem5 readFrame/writeFrame (FRAMEBUFFER_BAR=0)
-//   QEMU BAR4 (Doorbell) -> gem5 readDoorbell/writeDoorbell (DOORBELL_BAR=2)
+//   QEMU BAR0 (VRAM)     -> gem5 readFrame/writeFrame (FRAMEBUFFER_BAR=0)
+//   QEMU BAR2 (Doorbell) -> gem5 readDoorbell/writeDoorbell (DOORBELL_BAR=2)
+//   QEMU BAR5 (MMIO)     -> gem5 readMMIO/writeMMIO (MMIO_BAR=5)
 // ======================================================================
 
 uint64_t
