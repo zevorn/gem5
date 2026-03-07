@@ -36,6 +36,7 @@
 #include "debug/SDMAData.hh"
 #include "debug/SDMAEngine.hh"
 #include "dev/amdgpu/interrupt_handler.hh"
+#include "dev/amdgpu/memory_manager.hh"
 #include "dev/amdgpu/sdma_commands.hh"
 #include "dev/amdgpu/sdma_mmio.hh"
 #include "gpu-compute/gpu_command_processor.hh"
@@ -376,9 +377,19 @@ SDMAEngine::decodeNext(SDMAQueue *q)
         DPRINTF(SDMAEngine, "Writing rptr %#lx back to host addr %#lx\n",
                 q->globalRptr(), q->rptrWbAddr());
         if (q->rptrWbAddr()) {
-            auto cb = new DmaVirtCallback<uint64_t>(
-                [ = ](const uint64_t &) { }, q->globalRptr());
-            dmaWriteVirt(q->rptrWbAddr(), sizeof(Addr), cb, &cb->dmaBuffer);
+            Addr wb_addr = q->rptrWbAddr();
+            if (wb_addr < gpuDevice->getVRAMSize()) {
+                // VRAM address — write directly to device memory.
+                auto *buf = new uint64_t(q->globalRptr());
+                auto cb =
+                    new EventFunctionWrapper([=] { delete buf; }, name());
+                gpuDevice->getMemMgr()->writeRequest(wb_addr, (uint8_t *)buf,
+                                                     sizeof(Addr), 0, cb);
+            } else {
+                auto cb = new DmaVirtCallback<uint64_t>(
+                    [=](const uint64_t &) {}, q->globalRptr());
+                dmaWriteVirt(wb_addr, sizeof(Addr), cb, &cb->dmaBuffer);
+            }
         }
         q->processing(false);
         if (q->parent()) {
@@ -1571,7 +1582,12 @@ SDMAEngine::setGfxRptrLo(uint32_t data)
 {
     gfxRptr = insertBits(gfxRptr, 31, 0, 0);
     gfxRptr |= data;
-    gfx.rptrWbAddr(getGARTAddr(gfxRptr));
+    // VRAM addresses should not go through GART page-walk transform.
+    if (gfxRptr < gpuDevice->getVRAMSize()) {
+        gfx.rptrWbAddr(gfxRptr);
+    } else {
+        gfx.rptrWbAddr(getGARTAddr(gfxRptr));
+    }
 }
 
 void
@@ -1579,7 +1595,11 @@ SDMAEngine::setGfxRptrHi(uint32_t data)
 {
     gfxRptr = insertBits(gfxRptr, 63, 32, 0);
     gfxRptr |= ((uint64_t)data) << 32;
-    gfx.rptrWbAddr(getGARTAddr(gfxRptr));
+    if (gfxRptr < gpuDevice->getVRAMSize()) {
+        gfx.rptrWbAddr(gfxRptr);
+    } else {
+        gfx.rptrWbAddr(getGARTAddr(gfxRptr));
+    }
 }
 
 void
@@ -1657,7 +1677,11 @@ SDMAEngine::setPageRptrLo(uint32_t data)
 {
     pageRptr = insertBits(pageRptr, 31, 0, 0);
     pageRptr |= data;
-    page.rptrWbAddr(getGARTAddr(pageRptr));
+    if (pageRptr < gpuDevice->getVRAMSize()) {
+        page.rptrWbAddr(pageRptr);
+    } else {
+        page.rptrWbAddr(getGARTAddr(pageRptr));
+    }
 }
 
 void
@@ -1665,7 +1689,11 @@ SDMAEngine::setPageRptrHi(uint32_t data)
 {
     pageRptr = insertBits(pageRptr, 63, 32, 0);
     pageRptr |= ((uint64_t)data) << 32;
-    page.rptrWbAddr(getGARTAddr(pageRptr));
+    if (pageRptr < gpuDevice->getVRAMSize()) {
+        page.rptrWbAddr(pageRptr);
+    } else {
+        page.rptrWbAddr(getGARTAddr(pageRptr));
+    }
 }
 
 void

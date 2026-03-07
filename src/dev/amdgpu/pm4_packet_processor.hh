@@ -94,6 +94,13 @@ class PM4PacketProcessor : public DmaVirtDevice
     Addr getGARTAddr(Addr addr) const;
 
     /**
+     * Check if a raw address (before getGARTAddr) is a direct VRAM address.
+     * Used in cosim to route VRAM writes to device memory instead of
+     * going through GART translation (which only handles system memory).
+     */
+    bool isVRAMAddress(Addr addr) const;
+
+    /**
      * Based on an offset communicated through doorbell write, the
      * PM4PacketProcessor identifies which queue needs processing.
      */

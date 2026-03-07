@@ -36,6 +36,7 @@
 #include "dev/amdgpu/amdgpu_device.hh"
 #include "dev/amdgpu/hwreg_defines.hh"
 #include "dev/amdgpu/interrupt_handler.hh"
+#include "dev/amdgpu/memory_manager.hh"
 #include "dev/amdgpu/pm4_mmio.hh"
 #include "dev/amdgpu/sdma_engine.hh"
 #include "dev/hsa/hw_scheduler.hh"
@@ -98,6 +99,12 @@ PM4PacketProcessor::getGARTAddr(Addr addr) const
     return addr;
 }
 
+bool
+PM4PacketProcessor::isVRAMAddress(Addr addr) const
+{
+    return addr < gpuDevice->getVRAMSize();
+}
+
 PM4Queue *
 PM4PacketProcessor::getQueue(Addr offset, bool gfx)
 {
@@ -115,7 +122,11 @@ PM4PacketProcessor::getQueue(Addr offset, bool gfx)
 void
 PM4PacketProcessor::mapKiq(Addr offset)
 {
-    DPRINTF(PM4PacketProcessor, "Mapping KIQ\n");
+    DPRINTF(PM4PacketProcessor,
+            "Mapping KIQ: base=%#lx (lo=%#x hi=%#x) "
+            "rptr=%#x doorbell=%#x offset=%#lx\n",
+            kiq.base, kiq.hqd_pq_base_lo, kiq.hqd_pq_base_hi, kiq.rptr,
+            kiq.doorbell, offset);
     newQueue((QueueDesc *)&kiq, offset, &kiq_pkt);
 }
 
@@ -224,6 +235,14 @@ PM4PacketProcessor::decodeHeader(PM4Queue *q, PM4Header header)
             q->incRptr((header.count + 1) * sizeof(uint32_t));
         }
         decodeNext(q);
+        } break;
+        case IT_ACQUIRE_MEM: {
+            DPRINTF(PM4PacketProcessor,
+                    "PM4 acquire_mem (memory barrier), "
+                    "count %d\n",
+                    header.count);
+            q->incRptr((header.count + 1) * sizeof(uint32_t));
+            decodeNext(q);
         } break;
       case IT_WRITE_DATA: {
         dmaBuffer = new PM4WriteData();
@@ -343,6 +362,15 @@ PM4PacketProcessor::decodeHeader(PM4Queue *q, PM4Header header)
         decodeNext(q);
         } break;
 
+        case IT_SET_RESOURCES: {
+            DPRINTF(PM4PacketProcessor,
+                    "PM4 set_resources (queue resource "
+                    "config), count %d\n",
+                    header.count);
+            q->incRptr((header.count + 1) * sizeof(uint32_t));
+            decodeNext(q);
+        } break;
+
       default: {
         warn("PM4 packet opcode 0x%x not supported.\n", header.opcode);
         DPRINTF(PM4PacketProcessor, "PM4 packet opcode 0x%x not supported.\n",
@@ -365,18 +393,25 @@ PM4PacketProcessor::writeData(PM4Queue *q, PM4WriteData *pkt, PM4Header header)
 
     if (pkt->destSel == 5) {
         // Memory address destination
-        Addr addr = getGARTAddr(pkt->destAddr);
-
-        // This is a variable length packet. The size of the packet is in
-        // the header.count field and is set as Number Of Dwords - 1. This
-        // packet is 4 bytes minuimum meaning the count is minimum 3. To
-        // get the number of dwords of data subtract two from the count.
         unsigned size = (header.count - 2) * sizeof(uint32_t);
 
-        DPRINTF(PM4PacketProcessor, "Writing %d bytes to %p\n", size, addr);
-        auto cb = new DmaVirtCallback<uint32_t>(
-            [ = ](const uint32_t &) { writeDataDone(q, pkt, addr); });
-        dmaWriteVirt(addr, size, cb, &pkt->data);
+        if (isVRAMAddress(pkt->destAddr)) {
+            // Direct VRAM write — bypass GART, use device memory.
+            Addr addr = pkt->destAddr;
+            DPRINTF(PM4PacketProcessor, "Writing %d bytes to VRAM %p\n", size,
+                    addr);
+            auto cb = new EventFunctionWrapper(
+                [=] { writeDataDone(q, pkt, addr); }, name());
+            gpuDevice->getMemMgr()->writeRequest(addr, (uint8_t *)&pkt->data,
+                                                 size, 0, cb);
+        } else {
+            Addr addr = getGARTAddr(pkt->destAddr);
+            DPRINTF(PM4PacketProcessor, "Writing %d bytes to %p\n", size,
+                    addr);
+            auto cb = new DmaVirtCallback<uint32_t>(
+                [=](const uint32_t &) { writeDataDone(q, pkt, addr); });
+            dmaWriteVirt(addr, size, cb, &pkt->data);
+        }
 
         if (!pkt->writeConfirm) {
             decodeNext(q);
@@ -540,22 +575,73 @@ PM4PacketProcessor::releaseMem(PM4Queue *q, PM4ReleaseMem *pkt)
 {
     q->incRptr(sizeof(PM4ReleaseMem));
 
-    Addr addr = getGARTAddr(pkt->addr);
-    DPRINTF(PM4PacketProcessor, "PM4 release_mem event %d eventIdx %d intSel "
-            "%d destSel %d dataSel %d, address %p data %p, intCtx %p\n",
+    bool vram = isVRAMAddress(pkt->addr);
+    Addr addr = vram ? pkt->addr : getGARTAddr(pkt->addr);
+    DPRINTF(PM4PacketProcessor,
+            "PM4 release_mem event %d eventIdx %d intSel "
+            "%d destSel %d dataSel %d, address %p data %p, intCtx %p "
+            "vram=%d\n",
             pkt->event, pkt->eventIdx, pkt->intSelect, pkt->destSelect,
-            pkt->dataSelect, addr, pkt->dataLo, pkt->intCtxId);
+            pkt->dataSelect, addr, pkt->dataLo, pkt->intCtxId, vram);
 
     DPRINTF(PM4PacketProcessor,
             "PM4 release_mem destSel 0 bypasses caches to MC.\n");
 
-    if (pkt->dataSelect == 1) {
-        auto cb = new DmaVirtCallback<uint32_t>(
-            [ = ](const uint32_t &) { releaseMemDone(q, pkt, addr); },
-            pkt->dataLo);
-        dmaWriteVirt(addr, sizeof(uint32_t), cb, &cb->dmaBuffer);
+    if (pkt->dataSelect == 0) {
+        releaseMemDone(q, pkt, addr);
+    } else if (vram) {
+        // VRAM destination — write data directly to device memory.
+        // Copy from bit-fields into a local buffer for writeRequest.
+        auto *buf = new uint64_t;
+        unsigned wsize = 0;
+        if (pkt->dataSelect == 1) {
+            *buf = pkt->dataLo;
+            wsize = sizeof(uint32_t);
+        } else if (pkt->dataSelect == 2) {
+            *buf = pkt->data;
+            wsize = sizeof(uint64_t);
+        } else if (pkt->dataSelect == 3) {
+            *buf = static_cast<uint64_t>(curTick());
+            wsize = sizeof(uint64_t);
+        }
+        if (wsize > 0) {
+            auto cb = new EventFunctionWrapper(
+                [=] {
+                    releaseMemDone(q, pkt, addr);
+                    delete buf;
+                },
+                name());
+            gpuDevice->getMemMgr()->writeRequest(addr, (uint8_t *)buf, wsize,
+                                                 0, cb);
+        } else {
+            delete buf;
+            warn("Unimplemented PM4ReleaseMem.dataSelect=%d, treating as "
+                 "no-op",
+                 pkt->dataSelect);
+            releaseMemDone(q, pkt, addr);
+        }
     } else {
-        panic("Unimplemented PM4ReleaseMem.dataSelect");
+        if (pkt->dataSelect == 1) {
+            auto cb = new DmaVirtCallback<uint32_t>(
+                [=](const uint32_t &) { releaseMemDone(q, pkt, addr); },
+                pkt->dataLo);
+            dmaWriteVirt(addr, sizeof(uint32_t), cb, &cb->dmaBuffer);
+        } else if (pkt->dataSelect == 2) {
+            auto cb = new DmaVirtCallback<uint64_t>(
+                [=](const uint64_t &) { releaseMemDone(q, pkt, addr); },
+                pkt->data);
+            dmaWriteVirt(addr, sizeof(uint64_t), cb, &cb->dmaBuffer);
+        } else if (pkt->dataSelect == 3) {
+            auto cb = new DmaVirtCallback<uint64_t>(
+                [=](const uint64_t &) { releaseMemDone(q, pkt, addr); },
+                static_cast<uint64_t>(curTick()));
+            dmaWriteVirt(addr, sizeof(uint64_t), cb, &cb->dmaBuffer);
+        } else {
+            warn("Unimplemented PM4ReleaseMem.dataSelect=%d, treating as "
+                 "no-op",
+                 pkt->dataSelect);
+            releaseMemDone(q, pkt, addr);
+        }
     }
 }
 
@@ -846,11 +932,19 @@ PM4PacketProcessor::queryStatus(PM4Queue *q, PM4QueryStatus *pkt)
 
     if (pkt->interruptSel == 0 && pkt->command == 2) {
         // Write data value to fence address
-        Addr addr = getGARTAddr(pkt->addr);
-        DPRINTF(PM4PacketProcessor, "Using GART addr %lx\n", addr);
-        auto cb = new DmaVirtCallback<uint64_t>(
-            [ = ] (const uint64_t &) { queryStatusDone(q, pkt); }, pkt->data);
-        dmaWriteVirt(addr, sizeof(uint64_t), cb, &cb->dmaBuffer);
+        if (isVRAMAddress(pkt->addr)) {
+            DPRINTF(PM4PacketProcessor, "Using VRAM addr %lx\n", pkt->addr);
+            auto cb = new EventFunctionWrapper(
+                [=] { queryStatusDone(q, pkt); }, name());
+            gpuDevice->getMemMgr()->writeRequest(
+                pkt->addr, (uint8_t *)&pkt->data, sizeof(uint64_t), 0, cb);
+        } else {
+            Addr addr = getGARTAddr(pkt->addr);
+            DPRINTF(PM4PacketProcessor, "Using GART addr %lx\n", addr);
+            auto cb = new DmaVirtCallback<uint64_t>(
+                [=](const uint64_t &) { queryStatusDone(q, pkt); }, pkt->data);
+            dmaWriteVirt(addr, sizeof(uint64_t), cb, &cb->dmaBuffer);
+        }
     } else {
         // No other combinations used in amdkfd v9
         panic("query_status with interruptSel %d command %d not supported",
@@ -977,12 +1071,15 @@ void
 PM4PacketProcessor::setHqdPqBase(uint32_t data)
 {
     kiq.hqd_pq_base_lo = data;
+    DPRINTF(PM4PacketProcessor, "KIQ PQ base lo = %#x\n", data);
 }
 
 void
 PM4PacketProcessor::setHqdPqBaseHi(uint32_t data)
 {
     kiq.hqd_pq_base_hi = data;
+    DPRINTF(PM4PacketProcessor, "KIQ PQ base hi = %#x (full base = %#lx)\n",
+            data, kiq.base);
 }
 
 void

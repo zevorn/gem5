@@ -51,19 +51,21 @@ namespace gem5
  */
 enum it_opcode_type
 {
-    IT_NOP                               = 0x10,
-    IT_WRITE_DATA                        = 0x37,
-    IT_WAIT_REG_MEM                      = 0x3C,
-    IT_INDIRECT_BUFFER                   = 0x3F,
-    IT_RELEASE_MEM                       = 0x49,
-    IT_SET_UCONFIG_REG                   = 0x79,
-    IT_SWITCH_BUFFER                     = 0x8B,
-    IT_INVALIDATE_TLBS                   = 0x98,
-    IT_MAP_PROCESS                       = 0xA1,
-    IT_MAP_QUEUES                        = 0xA2,
-    IT_UNMAP_QUEUES                      = 0xA3,
-    IT_QUERY_STATUS                      = 0xA4,
-    IT_RUN_LIST                          = 0xA5,
+    IT_NOP = 0x10,
+    IT_WRITE_DATA = 0x37,
+    IT_WAIT_REG_MEM = 0x3C,
+    IT_INDIRECT_BUFFER = 0x3F,
+    IT_RELEASE_MEM = 0x49,
+    IT_ACQUIRE_MEM = 0x58,
+    IT_SET_UCONFIG_REG = 0x79,
+    IT_SWITCH_BUFFER = 0x8B,
+    IT_INVALIDATE_TLBS = 0x98,
+    IT_SET_RESOURCES = 0xA0,
+    IT_MAP_PROCESS = 0xA1,
+    IT_MAP_QUEUES = 0xA2,
+    IT_UNMAP_QUEUES = 0xA3,
+    IT_QUERY_STATUS = 0xA4,
+    IT_RUN_LIST = 0xA5,
 };
 
 /**
