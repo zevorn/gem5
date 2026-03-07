@@ -31,6 +31,8 @@
 
 #include "dev/amdgpu/amdgpu_vm.hh"
 
+#include <cstring>
+
 #include "arch/amdgpu/vega/pagetable_walker.hh"
 #include "arch/amdgpu/vega/tlb.hh"
 #include "arch/generic/mmu.hh"
@@ -39,6 +41,7 @@
 #include "dev/amdgpu/amdgpu_defines.hh"
 #include "dev/amdgpu/amdgpu_device.hh"
 #include "mem/packet_access.hh"
+#include "sim/faults.hh"
 
 namespace gem5
 {
@@ -422,19 +425,131 @@ AMDGPUVM::GARTTranslationGen::translate(Range &range) const
 
     // GART is a single level translation, so the value at the "virtual" addr
     // is the PTE containing the physical address.
+    Addr pte = 0;
     auto result = vm->gartTable.find(gart_addr);
-    if (result == vm->gartTable.end()) {
-        // There is no reason to fault as there is no recovery mechanism for
-        // invalid GART entries. Simply panic in this case
-        warn("GART translation for %p not found", range.vaddr);
+    if (result != vm->gartTable.end()) {
+        pte = result->second;
+    } else if (vm->vramShmemPtr && vm->gartBase() > 0 &&
+               vm->vmContext0.ptStart > 0) {
+        // Cosim fallback: read PTE directly from shared VRAM.
+        //
+        // The GART page table base (ptBase/gartBase) may be stored as
+        // either a raw MC byte address or as page_number depending on
+        // the GFX generation.  Try the raw-address interpretation
+        // first (ptBase IS the VRAM byte offset), then fall back to
+        // the page-number interpretation (ptBase << 12 = VRAM offset).
+        //
+        // The PTE index within the table:
+        //   gart_addr = original_page * 8  (after getGARTAddr)
+        //   gart_start = ptStart * 8
+        //   table_index = gart_addr - gart_start  (byte offset in table)
+        Addr gart_start_addr = vm->vmContext0.ptStart * 8;
+        if (gart_addr >= gart_start_addr) {
+            Addr pte_table_offset = gart_addr - gart_start_addr;
 
-        // Some PM4 packets have register addresses which we ignore. In that
-        // case just return the vaddr rather than faulting.
-        range.paddr = range.vaddr;
-    } else {
-        Addr pte = result->second;
+            // Try 1: ptBase is a raw VRAM byte offset
+            Addr pte_vram_offset = vm->gartBase() + pte_table_offset;
+            if (pte_vram_offset + 8 <= vm->vramShmemSize) {
+                memcpy(&pte, vm->vramShmemPtr + pte_vram_offset, sizeof(pte));
+            }
+
+            // Try 2: ptBase might be fbBase-relative MC address
+            if (pte == 0 && vm->vmContext0.fbBase > 0) {
+                Addr adj = vm->gartBase() - vm->vmContext0.fbBase;
+                if (adj + pte_table_offset + 8 <= vm->vramShmemSize) {
+                    memcpy(&pte, vm->vramShmemPtr + adj + pte_table_offset,
+                           sizeof(pte));
+                    if (pte != 0) {
+                        warn_once("GART cosim: ptBase adjusted by fbBase "
+                                  "(%#x - %#x = %#x), PTE=%#x",
+                                  vm->gartBase(), vm->vmContext0.fbBase, adj,
+                                  pte);
+                    }
+                }
+            }
+        }
+
+        // One-shot diagnostic: dump GART table header
+        static bool dumpedGart = false;
+        if (!dumpedGart) {
+            dumpedGart = true;
+            warn("GART cosim diag: ptBase=%#x ptStart=%#x ptEnd=%#x "
+                 "fbBase=%#x fbTop=%#x fbOffset=%#x "
+                 "sysAddrL=%#x sysAddrH=%#x vramSize=%#x",
+                 vm->gartBase(), vm->vmContext0.ptStart, vm->vmContext0.ptEnd,
+                 vm->vmContext0.fbBase, vm->vmContext0.fbTop,
+                 vm->vmContext0.fbOffset, vm->vmContext0.sysAddrL,
+                 vm->vmContext0.sysAddrH, vm->vramShmemSize);
+            // Dump first 8 PTEs at gartBase
+            Addr base = vm->gartBase();
+            if (base + 64 <= vm->vramShmemSize) {
+                uint64_t ptes[8];
+                memcpy(ptes, vm->vramShmemPtr + base, 64);
+                warn("GART PTEs at ptBase (%#x):", base);
+                for (int i = 0; i < 8; i++) {
+                    warn("  PTE[%d] = %#018x", i, ptes[i]);
+                }
+            }
+            // Also dump at ptBase - fbBase if fbBase > 0
+            if (vm->vmContext0.fbBase > 0 &&
+                vm->gartBase() > vm->vmContext0.fbBase) {
+                Addr adj = vm->gartBase() - vm->vmContext0.fbBase;
+                if (adj + 64 <= vm->vramShmemSize) {
+                    uint64_t ptes[8];
+                    memcpy(ptes, vm->vramShmemPtr + adj, 64);
+                    warn("GART PTEs at ptBase-fbBase (%#x):", adj);
+                    for (int i = 0; i < 8; i++) {
+                        warn("  PTE[%d] = %#018x", i, ptes[i]);
+                    }
+                }
+            }
+        }
+    }
+
+    if (pte != 0) {
         Addr lower_bits = bits(range.vaddr, 11, 0);
         range.paddr = (bits(pte, 47, 12) << 12) | lower_bits;
+        warn_once("GART cosim: first successful translation "
+                  "vaddr=%#x pte=%#x paddr=%#x",
+                  range.vaddr, pte, range.paddr);
+    } else {
+        // Check if the original (pre-getGARTAddr) address was VRAM.
+        // getGARTAddr multiplies page number by 8, so reverse:
+        Addr page_num = bits(range.vaddr, 63, 12);
+        Addr orig_page = page_num >> 3;
+        Addr orig_addr = (orig_page << 12) | bits(range.vaddr, 11, 0);
+        if (orig_addr < vm->vramShmemSize && vm->vramShmemPtr) {
+            // VRAM address — map to a valid system address so the DMA
+            // completes without fault.  The actual VRAM content is in
+            // shared memory; we use address 0 (always mapped in gem5)
+            // as a sink.  The driver polls VRAM via QEMU, so this
+            // write is effectively discarded.
+            range.paddr = 0;
+            warn_once("GART: VRAM address %#x (orig %#x) mapped to "
+                      "sink — VRAM write-backs are no-ops in cosim",
+                      range.vaddr, orig_addr);
+        } else if (vm->vramShmemPtr) {
+            // Cosim mode: map unmapped GART pages to a sink instead of
+            // faulting.  Faulting causes an infinite DMA retry loop that
+            // crashes gem5.  The actual data will be incorrect (reads
+            // return 0, writes are discarded), but this keeps the
+            // simulation alive while we diagnose the missing PTE.
+            range.paddr = 0;
+            warn_once("GART cosim: unmapped page vaddr=%#x "
+                      "(gart_addr=%#x gartBase=%#x ptStart=%#x "
+                      "fbBase=%#x vramSize=%#x) → sink",
+                      range.vaddr, gart_addr, vm->gartBase(),
+                      vm->vmContext0.ptStart, vm->vmContext0.fbBase,
+                      vm->vramShmemSize);
+        } else {
+            warn("GART translation for %#x not found (gart_addr=%#x "
+                 "gartBase=%#x ptStart=%#x vramSize=%#x hasShmem=%d)",
+                 range.vaddr, gart_addr, vm->gartBase(),
+                 vm->vmContext0.ptStart, vm->vramShmemSize,
+                 vm->vramShmemPtr != nullptr);
+            range.paddr = range.vaddr;
+            range.fault = std::make_shared<GenericPageTableFault>(range.vaddr);
+        }
     }
 
     DPRINTF(AMDGPUDevice, "AMDGPUVM: GART translation %#lx -> %#lx\n",

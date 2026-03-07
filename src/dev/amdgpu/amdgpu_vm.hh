@@ -231,6 +231,13 @@ class AMDGPUVM : public Serializable
      */
     std::unordered_map<uint64_t, uint64_t> gartTable;
 
+    /**
+     * Shared VRAM pointer for cosim mode. When set, GART PTE lookups
+     * fall back to reading from shared VRAM on gartTable miss.
+     */
+    uint8_t *vramShmemPtr = nullptr;
+    Addr vramShmemSize = 0;
+
     void readMMIO(PacketPtr pkt, Addr offset);
     void writeMMIO(PacketPtr pkt, Addr offset);
 

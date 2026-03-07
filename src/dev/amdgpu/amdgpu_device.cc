@@ -197,7 +197,9 @@ AMDGPUDevice::AMDGPUDevice(const AMDGPUDeviceParams &p)
     gpuvm.setMMIOAperture(GFX_MMIO_RANGE,  AddrRange(0x28000, 0x3F000));
     if (getGfxVersion() == GfxVersion::gfx942 ||
         getGfxVersion() == GfxVersion::gfx950) {
-        gpuvm.setMMIOAperture(MMHUB_MMIO_RANGE,  AddrRange(0x60D00, 0x62E20));
+        // Extended to 0x63400 to cover MI300X registers up to
+        // MI300X_VM_SYSTEM_APERTURE_HIGH_ADDR (index 0x0962, BAR5 0x63288)
+        gpuvm.setMMIOAperture(MMHUB_MMIO_RANGE, AddrRange(0x60D00, 0x63400));
     } else {
         gpuvm.setMMIOAperture(MMHUB_MMIO_RANGE,  AddrRange(0x68000, 0x6A120));
     }
@@ -708,6 +710,9 @@ AMDGPUDevice::writeMMIO(PacketPtr pkt, Addr offset)
     } else if (aperture == gpuvm.getMMIORange(GFX_MMIO_RANGE)) {
         DPRINTF(AMDGPUDevice, "GFX base\n");
         gfx.writeMMIO(pkt, aperture_offset);
+    } else if (aperture == gpuvm.getMMIORange(MMHUB_MMIO_RANGE)) {
+        DPRINTF(AMDGPUDevice, "MMHUB base\n");
+        gpuvm.writeMMIO(pkt, aperture_offset >> MMHUB_OFFSET_SHIFT);
     } else if (aperture == gpuvm.getMMIORange(SMU_MMIO_RANGE)) {
         DPRINTF(AMDGPUDevice, "SMU base\n");
         smu.writeMMIO(pkt, aperture_offset >> SMU_OFFSET_SHIFT);
