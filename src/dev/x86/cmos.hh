@@ -81,9 +81,14 @@ class Cmos : public BasicPioDevice
   public:
     typedef CmosParams Params;
 
-    Cmos(const Params &p) : BasicPioDevice(p, 2), latency(p.pio_latency),
-        rtc(this, name() + ".rtc", p.time, true, 5000000000ULL,
-                p.port_int_pin_connection_count)
+    bool disableRtcEvents;
+
+    Cmos(const Params &p)
+        : BasicPioDevice(p, 2),
+          latency(p.pio_latency),
+          rtc(this, name() + ".rtc", p.time, true, 5000000000ULL,
+              p.port_int_pin_connection_count),
+          disableRtcEvents(p.disable_rtc_events)
     {
         memset(regs, 0, numRegs * sizeof(uint8_t));
         address = 0;

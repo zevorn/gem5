@@ -35,3 +35,6 @@ class I8254(BasicPioDevice):
     cxx_header = "dev/x86/i8254.hh"
 
     int_pin = IntSourcePin("Pin to signal timer interrupts to")
+    disable_timer_events = Param.Bool(
+        False, "Disable PIT counter events (for cosim)"
+    )

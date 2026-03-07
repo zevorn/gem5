@@ -96,7 +96,9 @@ X86ISA::I8254::unserialize(CheckpointIn &cp)
 void
 X86ISA::I8254::startup()
 {
-    pit.startup();
+    if (!disableTimerEvents) {
+        pit.startup();
+    }
 }
 
 } // namespace gem5

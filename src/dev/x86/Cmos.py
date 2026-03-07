@@ -38,3 +38,6 @@ class Cmos(BasicPioDevice):
         "01/01/2012", "System time to use ('Now' for actual time)"
     )
     int_pin = IntSourcePin("Pin to signal RTC alarm interrupts to")
+    disable_rtc_events = Param.Bool(
+        False, "Disable RTC periodic/tick events (for cosim)"
+    )

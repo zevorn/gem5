@@ -120,7 +120,9 @@ X86ISA::Cmos::writeRegister(uint8_t reg, uint8_t val)
 void
 X86ISA::Cmos::startup()
 {
-    rtc.startup();
+    if (!disableRtcEvents) {
+        rtc.startup();
+    }
 }
 
 void

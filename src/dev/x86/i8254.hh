@@ -80,8 +80,13 @@ class I8254 : public BasicPioDevice
             return BasicPioDevice::getPort(if_name, idx);
     }
 
-    I8254(const Params &p) : BasicPioDevice(p, 4), latency(p.pio_latency),
-            pit(p.name, this)
+    bool disableTimerEvents;
+
+    I8254(const Params &p)
+        : BasicPioDevice(p, 4),
+          latency(p.pio_latency),
+          pit(p.name, this),
+          disableTimerEvents(p.disable_timer_events)
     {
         for (int i = 0; i < p.port_int_pin_connection_count; i++) {
             intPin.push_back(new IntSourcePin<I8254>(csprintf(
