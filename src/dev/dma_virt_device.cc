@@ -31,6 +31,8 @@
 
 #include "dev/dma_virt_device.hh"
 
+#include <cstring>
+
 namespace gem5
 {
 
@@ -63,7 +65,21 @@ DmaVirtDevice::dmaVirt(DmaFnPtr dmaFn, Addr addr, unsigned size,
 
     TranslationGenPtr gen = translate(addr, size);
     for (const auto &range: *gen) {
-        fatal_if(range.fault, "Failed translation: vaddr 0x%x", range.vaddr);
+        if (range.fault) {
+            warn("DmaVirtDevice: translation fault at vaddr %#x, "
+                 "skipping DMA for this range",
+                 range.vaddr);
+            // Zero-fill the destination buffer for failed reads
+            memset(loc_data, 0, range.size);
+            loc_data += range.size;
+            // Allocate and immediately schedule the chunk event so the
+            // callback's count still balances and process() eventually fires.
+            if (cb) {
+                Event *event = cb->getChunkEvent();
+                schedule(event, curTick() + delay);
+            }
+            continue;
+        }
 
         Event *event = cb ? cb->getChunkEvent() : nullptr;
         (this->*dmaFn)(range.paddr, range.size, event, loc_data, delay);
