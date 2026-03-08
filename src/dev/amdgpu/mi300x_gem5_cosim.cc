@@ -169,6 +169,9 @@ MI300XGem5Cosim::setupSharedMemory()
     // Enable GART PTE fallback from shared VRAM in cosim mode
     gpuDevice->getVM().vramShmemPtr = static_cast<uint8_t *>(shmemPtr);
     gpuDevice->getVM().vramShmemSize = vramSize;
+
+    // Enable page table walker reads from shared VRAM (fixes VMID>0 walks)
+    gpuDevice->getVM().setupWalkerCosim();
 }
 
 void

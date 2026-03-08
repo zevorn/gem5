@@ -34,6 +34,7 @@
 #include <memory>
 
 #include "arch/amdgpu/vega/faults.hh"
+#include "dev/amdgpu/amdgpu_vm.hh"
 #include "mem/abstract_mem.hh"
 #include "mem/packet_access.hh"
 
@@ -84,9 +85,36 @@ Walker::WalkerState::startFunctional(Addr base, Addr vaddr,
         DPRINTF(GPUPTWalker, "Sending functional read to %#lx\n",
                 read->getAddr());
 
-        auto devmem = walker->system->getDeviceMemory(read);
-        assert(devmem);
-        devmem->access(read);
+        bool readFromShmem = false;
+        if (walker->gpuVM && walker->gpuVM->vramShmemPtr) {
+            Addr addr = read->getAddr();
+            Addr fbBase = walker->gpuVM->getFBBase();
+            Addr sz = read->getSize();
+            Addr shmemSize = walker->gpuVM->vramShmemSize;
+            Addr offset = (Addr)-1;
+
+            if (fbBase > 0 && addr >= fbBase &&
+                (addr - fbBase + sz) <= shmemSize) {
+                offset = addr - fbBase;
+            } else if (addr + sz <= shmemSize) {
+                offset = addr;
+            }
+
+            if (offset != (Addr)-1) {
+                memcpy(read->getPtr<uint8_t>(),
+                       walker->gpuVM->vramShmemPtr + offset, sz);
+                readFromShmem = true;
+                DPRINTF(GPUPTWalker,
+                        "Cosim: read PTE from shmem "
+                        "addr=%#lx offset=%#lx data=%#lx\n",
+                        addr, offset, read->getLE<uint64_t>());
+            }
+        }
+        if (!readFromShmem) {
+            auto devmem = walker->system->getDeviceMemory(read);
+            assert(devmem);
+            devmem->access(read);
+        }
 
         fault = stepWalk();
         assert(fault == NoFault || read == NULL);
@@ -393,6 +421,41 @@ bool Walker::sendTiming(WalkerState* sending_walker, PacketPtr pkt)
         recvTimingResp(pkt);
 
         return true;
+    }
+
+    // Cosim: read PTE from shared VRAM if address is in VRAM range.
+    // Page table addresses may be either:
+    //   1. MC addresses (>= fbBase): offset = addr - fbBase
+    //   2. Raw VRAM byte offsets (< fbBase but < vramShmemSize)
+    if (gpuVM && gpuVM->vramShmemPtr) {
+        Addr addr = pkt->getAddr();
+        Addr fbBase = gpuVM->getFBBase();
+        Addr shmemSize = gpuVM->vramShmemSize;
+        Addr offset = (Addr)-1;
+
+        if (fbBase > 0 && addr >= fbBase && (addr - fbBase + 8) <= shmemSize) {
+            offset = addr - fbBase;
+        } else if (addr + 8 <= shmemSize) {
+            offset = addr;
+        }
+
+        if (offset != (Addr)-1) {
+            uint64_t data;
+            memcpy(&data, gpuVM->vramShmemPtr + offset, sizeof(data));
+            pkt->setLE<uint64_t>(data);
+            DPRINTF(GPUPTWalker,
+                    "Cosim: timing read PTE from shmem "
+                    "addr=%#lx offset=%#lx data=%#lx\n",
+                    addr, offset, data);
+            if (enable_pwc && pwc.findEntry(addr) == nullptr) {
+                pwc.insert(addr, data);
+            }
+            recvTimingResp(pkt);
+            return true;
+        }
+        warn_once("Cosim walker: addr %#lx not in VRAM shmem "
+                  "(fbBase=%#lx shmemSize=%#lx)",
+                  addr, fbBase, shmemSize);
     }
 
     if (port.sendTimingReq(pkt)) {

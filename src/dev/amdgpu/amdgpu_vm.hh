@@ -382,7 +382,7 @@ class AMDGPUVM : public Serializable
      */
     void registerTLB(VegaISA::GpuTLB *tlb);
     void invalidateTLBs();
-
+    void setupWalkerCosim();
 
     void serialize(CheckpointOut &cp) const override;
     void unserialize(CheckpointIn &cp) override;

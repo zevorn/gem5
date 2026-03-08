@@ -292,6 +292,18 @@ AMDGPUVM::invalidateTLBs()
 }
 
 void
+AMDGPUVM::setupWalkerCosim()
+{
+    DPRINTF(AMDGPUDevice,
+            "setupWalkerCosim: %d TLBs registered, vramShmemPtr=%p "
+            "vramShmemSize=%#lx\n",
+            gpu_tlbs.size(), vramShmemPtr, vramShmemSize);
+    for (auto &tlb : gpu_tlbs) {
+        tlb->getWalker()->setGpuVM(this);
+    }
+}
+
+void
 AMDGPUVM::serialize(CheckpointOut &cp) const
 {
     Addr vm0PTBase = vmContext0.ptBase;

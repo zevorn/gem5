@@ -47,6 +47,7 @@
 namespace gem5
 {
 
+class AMDGPUVM;
 class ThreadContext;
 
 namespace VegaISA
@@ -191,7 +192,15 @@ class Walker : public ClockedObject
     // System pointer for functional accesses
     System *system;
 
+    // Cosim: pointer to GPU VM for shared VRAM page table reads
+    AMDGPUVM *gpuVM = nullptr;
+
   public:
+    void
+    setGpuVM(AMDGPUVM *vm)
+    {
+        gpuVM = vm;
+    }
     void setTLB(GpuTLB * _tlb)
     {
         assert(tlb == nullptr); // only set it once
