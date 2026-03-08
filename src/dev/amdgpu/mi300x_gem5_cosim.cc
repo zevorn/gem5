@@ -233,6 +233,7 @@ MI300XGem5Cosim::acceptConnection()
     } else if (eventClientFd < 0) {
         eventClientFd = cli_fd;
         connected = true;
+        wasConnected = true;
         inform("MI300XGem5Cosim: Event connection established fd=%d", cli_fd);
     }
 }
@@ -250,6 +251,15 @@ MI300XGem5Cosim::closeClient(int fd)
     } else if (fd == eventClientFd) {
         eventClientFd = -1;
         connected = false;
+    }
+
+    // Exit simulation when all cosim clients have disconnected.
+    // This handles both graceful shutdown (QEMU sends SHUTDOWN then
+    // closes sockets) and unexpected disconnect (QEMU crash).
+    if (wasConnected && mmioClientFd < 0 && eventClientFd < 0) {
+        inform("MI300XGem5Cosim: all clients disconnected, "
+               "exiting simulation");
+        exitSimLoop("QEMU shutdown request", 0);
     }
 }
 
@@ -396,9 +406,11 @@ MI300XGem5Cosim::handleInit(int fd, const CosimMsgHeader &msg)
 void
 MI300XGem5Cosim::handleShutdown(int fd, const CosimMsgHeader &msg)
 {
-    inform("MI300XGem5Cosim: SHUTDOWN from QEMU, exiting simulation");
-    closeClient(fd);
-    exitSimLoop("QEMU shutdown request", 0);
+    // Don't close the connection or exit immediately. The guest kernel
+    // may still be running driver teardown (amdgpu fini / KIQ disable)
+    // which needs MMIO access to the GPU. We exit when all clients
+    // disconnect (detected via POLLHUP in ClientEvent::process).
+    inform("MI300XGem5Cosim: SHUTDOWN notification from QEMU");
 }
 
 void

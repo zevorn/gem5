@@ -228,6 +228,7 @@ class MI300XGem5Cosim : public SimObject
     uint8_t *dmaBuf = nullptr;
 
     bool connected = false;
+    bool wasConnected = false;
 
     // Keepalive event to prevent the event queue from draining.
     // Without periodic timer devices (RTC/PIT disabled for cosim),

@@ -408,6 +408,7 @@ if __name__ == "__m5_main__":
             "m5_exit instruction encountered",
             "user interrupt received",
             "simulate() limit reached",
+            "QEMU shutdown request",
         ):
             break
         elif "GPU Kernel Completed" in cause:
