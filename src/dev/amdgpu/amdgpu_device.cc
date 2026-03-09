@@ -35,7 +35,6 @@
 
 #include "debug/AMDGPUDevice.hh"
 #include "dev/amdgpu/amdgpu_nbio.hh"
-#include "dev/amdgpu/mi300x_gem5_cosim.hh"
 #include "dev/amdgpu/amdgpu_vm.hh"
 #include "dev/amdgpu/interrupt_handler.hh"
 #include "dev/amdgpu/pm4_packet_processor.hh"

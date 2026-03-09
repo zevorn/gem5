@@ -9,11 +9,21 @@ kernel, no CPU execution).  QEMU handles all host-side simulation
 (CPU, kernel boot, PCI enumeration, ROCm driver); gem5 provides
 the GPU compute back-end via a Unix domain socket bridge.
 
+Two backends are supported (--cosim-backend):
+
+  vfio-user (default):
+    Uses the standard vfio-user protocol via libvfio-user.
+    QEMU side uses upstream vfio-user-pci device — no custom QEMU code.
+    Supports eventfd MSI-X (KVM direct injection) and DMA fd passing.
+
+  legacy:
+    Uses the custom cosim socket protocol with QEMU's mi300x-gem5 device.
+
 Architecture:
     QEMU (guest Linux + amdgpu driver)
-        |  Unix domain socket (MMIO, doorbell, DMA, IRQ)
+        |  Unix domain socket
         v
-    MI300XGem5Cosim (this config, in gem5)
+    MI300XVfioUser / MI300XGem5Cosim (this config, in gem5)
         |  forward via AMDGPUDevice read/write
         v
     AMDGPUDevice + Shader + Ruby GPU hierarchy
@@ -22,7 +32,7 @@ Shared memory:
     /dev/shm/cosim-guest-ram  - guest physical memory (QEMU + gem5 DMA)
     /dev/shm/mi300x-vram      - GPU VRAM (QEMU driver + gem5 shader)
 
-Usage:
+Usage (vfio-user, default):
     # Terminal 1 - start gem5 (waits for QEMU to connect):
     build/VEGA_X86/gem5.opt configs/example/gpufs/mi300_cosim.py \
         --socket-path /tmp/gem5-mi300x.sock \
@@ -34,8 +44,7 @@ Usage:
         -object memory-backend-file,id=mem0,size=8G,\
                 mem-path=/dev/shm/cosim-guest-ram,share=on \
         -numa node,memdev=mem0 \
-        -device mi300x-gem5,gem5-socket=/tmp/gem5-mi300x.sock,\
-                shmem-path=/dev/shm/mi300x-vram \
+        -device vfio-user-pci,socket=/tmp/gem5-mi300x.sock \
         -drive file=disk-image,format=raw,if=virtio \
         -kernel vmlinux -append "console=ttyS0 root=/dev/vda1" \
         -nographic
@@ -85,6 +94,13 @@ def addCosimOptions(parser):
         type=str,
         default="/cosim-guest-ram",
         help="POSIX shared memory name for host (guest) RAM",
+    )
+    parser.add_argument(
+        "--cosim-backend",
+        type=str,
+        choices=["vfio-user", "legacy"],
+        default="vfio-user",
+        help="Co-simulation backend: vfio-user (standard) or legacy (custom)",
     )
 
 
@@ -345,12 +361,21 @@ def buildCosimSystem(args):
     # ----------------------------------------------------------------
     # Co-simulation bridge
     # ----------------------------------------------------------------
-    system.cosim = MI300XGem5Cosim(
-        gpu_device=system.pc.south_bridge.gpu,
-        socket_path=args.socket_path,
-        shmem_path=args.shmem_path,
-        vram_size=args.dgpu_mem_size,
-    )
+    backend = getattr(args, "cosim_backend", "vfio-user")
+    if backend == "vfio-user":
+        system.cosim = MI300XVfioUser(
+            gpu_device=system.pc.south_bridge.gpu,
+            socket_path=args.socket_path,
+            shmem_path=args.shmem_path,
+            vram_size=args.dgpu_mem_size,
+        )
+    else:
+        system.cosim = MI300XGem5Cosim(
+            gpu_device=system.pc.south_bridge.gpu,
+            socket_path=args.socket_path,
+            shmem_path=args.shmem_path,
+            vram_size=args.dgpu_mem_size,
+        )
 
     return system
 
@@ -389,8 +414,10 @@ if __name__ == "__m5_main__":
 
     m5.instantiate()
 
+    backend = getattr(args, "cosim_backend", "vfio-user")
     print("=" * 60)
     print("gem5 MI300X co-simulation server ready")
+    print(f"  Backend:    {backend}")
     print(f"  Socket:     {args.socket_path}")
     print(f"  VRAM SHM:   {args.shmem_path}")
     print(f"  Host SHM:   {args.shmem_host_path}")
@@ -409,6 +436,7 @@ if __name__ == "__m5_main__":
             "user interrupt received",
             "simulate() limit reached",
             "QEMU shutdown request",
+            "QEMU disconnected",
         ):
             break
         elif "GPU Kernel Completed" in cause:

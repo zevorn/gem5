@@ -40,6 +40,7 @@
 #include "dev/amdgpu/amdgpu_nbio.hh"
 #include "dev/amdgpu/amdgpu_smu.hh"
 #include "dev/amdgpu/amdgpu_vm.hh"
+#include "dev/amdgpu/cosim_bridge.hh"
 #include "dev/amdgpu/memory_manager.hh"
 #include "dev/amdgpu/mmio_reader.hh"
 #include "dev/io_device.hh"
@@ -52,7 +53,6 @@ namespace gem5
 
 class AMDGPUInterruptHandler;
 class SDMAEngine;
-class MI300XGem5Cosim;
 class System;
 
 /**
@@ -65,9 +65,10 @@ class System;
  */
 class AMDGPUDevice : public PciEndpoint
 {
-    // Allow co-simulation bridge to call readDoorbell/writeDoorbell/
+    // Allow co-simulation bridges to call readDoorbell/writeDoorbell/
     // readFrame/writeFrame directly for proper BAR-level forwarding.
     friend class MI300XGem5Cosim;
+    friend class MI300XVfioUser;
 
   private:
     /**
@@ -169,7 +170,7 @@ class AMDGPUDevice : public PciEndpoint
     System *system;
 
     /* Co-simulation bridge (nullptr when not in cosim mode) */
-    MI300XGem5Cosim *cosimBridge = nullptr;
+    CosimBridge *cosimBridge = nullptr;
 
     /* Device information */
     GfxVersion gfx_version = GfxVersion::gfx900;
@@ -244,8 +245,16 @@ class AMDGPUDevice : public PciEndpoint
     void insertQId(uint16_t vmid, int id);
 
     /* Co-simulation bridge accessor */
-    void setCosimBridge(MI300XGem5Cosim *bridge) { cosimBridge = bridge; }
-    MI300XGem5Cosim* getCosimBridge() const { return cosimBridge; }
+    void
+    setCosimBridge(CosimBridge *bridge)
+    {
+        cosimBridge = bridge;
+    }
+    CosimBridge *
+    getCosimBridge() const
+    {
+        return cosimBridge;
+    }
 
     /* Device information */
     GfxVersion getGfxVersion() const { return gfx_version; }

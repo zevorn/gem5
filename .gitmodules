@@ -1,0 +1,3 @@
+[submodule "ext/libvfio-user"]
+	path = ext/libvfio-user
+	url = https://gitlab.com/qemu-project/libvfio-user.git

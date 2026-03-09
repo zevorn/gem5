@@ -42,6 +42,7 @@
 #include "base/pollevent.hh"
 #include "base/types.hh"
 #include "dev/amdgpu/amdgpu_defines.hh"
+#include "dev/amdgpu/cosim_bridge.hh"
 #include "params/MI300XGem5Cosim.hh"
 #include "sim/eventq.hh"
 #include "sim/sim_object.hh"
@@ -126,7 +127,7 @@ static constexpr size_t COSIM_DMA_BUF_SIZE = 4 * 1024 * 1024; /* 4MB */
  *
  * VRAM is shared via mmap'd /dev/shm region for zero-copy access.
  */
-class MI300XGem5Cosim : public SimObject
+class MI300XGem5Cosim : public SimObject, public CosimBridge
 {
   public:
     PARAMS(MI300XGem5Cosim);
@@ -203,8 +204,8 @@ class MI300XGem5Cosim : public SimObject
   public:
     bool sendDmaRead(uint64_t addr, uint64_t len);
     bool sendDmaWrite(uint64_t addr, uint64_t len, const uint8_t *data);
-    bool sendIrqRaise(uint32_t vector);
-    bool sendIrqLower(uint32_t vector);
+    bool sendIrqRaise(uint32_t vector) override;
+    bool sendIrqLower(uint32_t vector) override;
 
   private:
     AMDGPUDevice *gpuDevice;
