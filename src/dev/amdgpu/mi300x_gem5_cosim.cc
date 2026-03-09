@@ -81,6 +81,10 @@ MI300XGem5Cosim::~MI300XGem5Cosim()
     }
     clientEvents.clear();
 
+    if (!socketPath.empty()) {
+        unlink(socketPath.c_str());
+    }
+
     delete[] dmaBuf;
     dmaBuf = nullptr;
 }
@@ -184,6 +188,9 @@ MI300XGem5Cosim::cleanupSharedMemory()
     if (shmemFd >= 0) {
         close(shmemFd);
         shmemFd = -1;
+    }
+    if (!shmemPath.empty()) {
+        shm_unlink(shmemPath.c_str());
     }
 }
 
