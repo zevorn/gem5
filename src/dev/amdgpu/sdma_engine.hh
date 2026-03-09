@@ -171,7 +171,9 @@ class SDMAEngine : public DmaVirtDevice
     Addr mmioBase = 0;
     Addr mmioSize = 0;
 
-    static constexpr Tick sdma_delay = 1e9;
+    // Cosim: small delay so SDMA completes within driver timeout (~200ms).
+    // Standalone gem5 GPU FS uses 1e9 for timing accuracy.
+    static constexpr Tick sdma_delay = 1000;
 
   public:
     SDMAEngine(const SDMAEngineParams &p);

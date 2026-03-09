@@ -41,6 +41,9 @@
 
 #define _Static_assert static_assert
 #include <libvfio-user.h>
+#include <pci_caps/common.h>
+#include <pci_caps/msix.h>
+#include <pci_caps/px.h>
 
 #undef _Static_assert
 
@@ -187,12 +190,15 @@ class MI300XVfioUser : public SimObject, public CosimBridge
     // BAR sizes
     static constexpr size_t BAR0_SIZE = 16ULL * 1024 * 1024 * 1024; // VRAM
     static constexpr size_t BAR2_SIZE = 2 * 1024 * 1024;            // Doorbell
-    static constexpr size_t BAR4_SIZE = 4096;                       // MSI-X
+    static constexpr size_t BAR4_SIZE = 8192;                       // MSI-X
     static constexpr size_t BAR5_SIZE = 512 * 1024;                 // MMIO
     static constexpr int NUM_MSIX_VECTORS = 256;
 
     // Keepalive event
-    static constexpr Tick KEEPALIVE_INTERVAL = 1000000;
+    // Must be large enough to cover SDMA processing delays (sdma_delay=1e9)
+    // so that gem5 completes GPU work within the driver's timeout (~200ms).
+    // PollEvent handles vfio-user messages independently of this interval.
+    static constexpr Tick KEEPALIVE_INTERVAL = 1000000000;
     EventFunctionWrapper keepaliveEvent;
     void processKeepalive();
 };

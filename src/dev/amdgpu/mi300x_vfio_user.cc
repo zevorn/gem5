@@ -138,7 +138,7 @@ MI300XVfioUser::initVfuContext()
              strerror(errno));
 
     // Set PCI IDs in config space
-    vfu_pci_set_id(vfuCtx, 0x1002, 0x74A1, 0x1002, 0x74A1);
+    vfu_pci_set_id(vfuCtx, 0x1002, 0x74A0, 0x1002, 0x74A0);
     vfu_pci_set_class(vfuCtx, 0x03, 0x00, 0x00);
 
     setupBars();
@@ -149,10 +149,56 @@ MI300XVfioUser::initVfuContext()
     ret = vfu_setup_device_reset_cb(vfuCtx, resetCb);
     fatal_if(ret < 0, "MI300XVfioUser: reset_cb setup failed");
 
+    // PCIe Express capability (required for amdgpu driver)
+    struct pxcap px = {};
+    px.hdr.id = PCI_CAP_ID_EXP;
+    px.pxcaps.ver = 2;  // PCIe capability version 2
+    px.pxcaps.dpt = 0;  // Endpoint device
+    px.pxdcap.mps = 2;  // Max payload 512 bytes
+    px.pxdcap.flrc = 1; // Function-level reset capable
+    ret = vfu_pci_add_capability(vfuCtx, 0, 0, &px);
+    fatal_if(ret < 0, "MI300XVfioUser: add PCIe cap failed: %s",
+             strerror(errno));
+
+    // MSI-X capability — table and PBA in BAR4
+    struct msixcap msix = {};
+    msix.hdr.id = PCI_CAP_ID_MSIX;
+    msix.mxc.ts = NUM_MSIX_VECTORS - 1;           // table size (N-1)
+    msix.mtab.tbir = 4;                           // table in BAR4
+    msix.mtab.to = 0;                             // table at offset 0
+    msix.mpba.pbir = 4;                           // PBA in BAR4
+    msix.mpba.pbao = (NUM_MSIX_VECTORS * 16) / 8; // PBA after table
+    // Flag 0: let libvfio-user handle MSI-X reads/writes internally
+    // via cap_write_msix (tracks enable/mask state). VFU_CAP_FLAG_CALLBACK
+    // would redirect to our cfgAccessCb which doesn't handle MSI-X.
+    ret = vfu_pci_add_capability(vfuCtx, 0, 0, &msix);
+    fatal_if(ret < 0, "MI300XVfioUser: add MSI-X cap failed: %s",
+             strerror(errno));
+
     // Finalize
     ret = vfu_realize_ctx(vfuCtx);
     fatal_if(ret < 0, "MI300XVfioUser: vfu_realize_ctx failed: %s",
              strerror(errno));
+
+    // Fix BAR register type bits after vfu_realize_ctx().
+    // vfu_realize_ctx() incorrectly sets the IO bit on BARs without a
+    // registered region (BAR1, BAR3 = upper halves of 64-bit pairs).
+    // Clear those and set correct type bits for 64-bit BARs.
+    auto *cfg = vfu_pci_get_config_space(vfuCtx);
+
+    // BAR0+BAR1: 64-bit prefetchable memory (VRAM 16GB)
+    cfg->hdr.bars[0].mem.locatable = 2; // 64-bit
+    cfg->hdr.bars[0].mem.prefetchable = 1;
+    cfg->hdr.bars[1].raw = 0; // upper half, must be zero
+
+    // BAR2+BAR3: 64-bit non-prefetchable memory (Doorbell)
+    cfg->hdr.bars[2].mem.locatable = 2; // 64-bit
+    cfg->hdr.bars[3].raw = 0;           // upper half, must be zero
+
+    inform("MI300XVfioUser: BAR type bits set: "
+           "BAR0=0x%x BAR1=0x%x BAR2=0x%x BAR3=0x%x",
+           cfg->hdr.bars[0].raw, cfg->hdr.bars[1].raw, cfg->hdr.bars[2].raw,
+           cfg->hdr.bars[3].raw);
 
     // Register poll fd with gem5 event loop
     vfuPollFd = vfu_get_poll_fd(vfuCtx);
@@ -191,6 +237,12 @@ MI300XVfioUser::setupBars()
         vfuCtx, VFU_PCI_DEV_BAR2_REGION_IDX, BAR2_SIZE, bar2AccessCb,
         VFU_REGION_FLAG_RW | VFU_REGION_FLAG_MEM, NULL, 0, -1, 0);
     fatal_if(ret < 0, "MI300XVfioUser: BAR2 (Doorbell) setup failed");
+
+    // BAR4: MSI-X table and PBA — handled internally by libvfio-user
+    ret = vfu_setup_region(vfuCtx, VFU_PCI_DEV_BAR4_REGION_IDX, BAR4_SIZE,
+                           NULL, VFU_REGION_FLAG_RW | VFU_REGION_FLAG_MEM,
+                           NULL, 0, -1, 0);
+    fatal_if(ret < 0, "MI300XVfioUser: BAR4 (MSI-X) setup failed");
 
     // BAR5: MMIO registers — callback only
     ret = vfu_setup_region(
@@ -351,6 +403,10 @@ MI300XVfioUser::handleMmioAccess(char *buf, size_t count, loff_t offset,
         } else {
             uint64_t data = gpuMmioRead(cur_off, chunk);
             memcpy(buf + done, &data, chunk);
+            DPRINTF(MI300XCosim,
+                    "vfio-user MMIO Read: offset=0x%lx size=%lu "
+                    "data=0x%lx\n",
+                    (uint64_t)cur_off, chunk, data);
         }
         done += chunk;
     }
@@ -367,15 +423,17 @@ MI300XVfioUser::handleDoorbellAccess(char *buf, size_t count, loff_t offset,
 {
     size_t done = 0;
     while (done < count) {
-        size_t chunk = std::min(count - done, (size_t)4);
+        // Doorbell accesses can be 4 or 8 bytes.
+        // AMDGPUDevice::writeDoorbell expects 8-byte packets.
+        size_t chunk = std::min(count - done, (size_t)8);
         loff_t cur_off = offset + done;
 
         if (is_write) {
-            uint32_t data = 0;
+            uint64_t data = 0;
             memcpy(&data, buf + done, chunk);
             DPRINTF(MI300XCosim,
                     "vfio-user Doorbell Write: offset=0x%lx size=%lu "
-                    "data=0x%x\n",
+                    "data=0x%lx\n",
                     (uint64_t)cur_off, chunk, data);
             gpuDoorbellWrite(cur_off, chunk, data);
         } else {
@@ -461,6 +519,10 @@ MI300XVfioUser::handleCfgAccess(char *buf, size_t count, loff_t offset,
         } else {
             uint64_t data = gpuConfigRead(cur_off, chunk);
             memcpy(buf + done, &data, chunk);
+            DPRINTF(MI300XCosim,
+                    "vfio-user Config Read: offset=0x%lx size=%lu "
+                    "data=0x%lx\n",
+                    (uint64_t)cur_off, chunk, data);
         }
         done += chunk;
     }
@@ -697,9 +759,11 @@ MI300XVfioUser::gpuDoorbellWrite(uint64_t offset, uint32_t size, uint64_t data)
 {
     fatal_if(!gpuDevice, "MI300XVfioUser: gpu_device not set");
 
+    // AMDGPUDevice::writeDoorbell uses pkt->getLE<uint64_t>(),
+    // so always create an 8-byte packet regardless of access size.
     uint64_t pkt_data = htole(data);
-    RequestPtr req = std::make_shared<Request>(offset, size, 0,
-                                               gpuDevice->vramRequestorId());
+    RequestPtr req =
+        std::make_shared<Request>(offset, 8, 0, gpuDevice->vramRequestorId());
     PacketPtr pkt = Packet::createWrite(req);
     pkt->dataStatic(reinterpret_cast<uint8_t *>(&pkt_data));
 

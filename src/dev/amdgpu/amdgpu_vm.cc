@@ -564,8 +564,8 @@ AMDGPUVM::GARTTranslationGen::translate(Range &range) const
         }
     }
 
-    DPRINTF(AMDGPUDevice, "AMDGPUVM: GART translation %#lx -> %#lx\n",
-            range.vaddr, range.paddr);
+    DPRINTF(AMDGPUDevice, "GART xlat: vaddr=%#x paddr=%#x (pte=%#x)\n",
+            range.vaddr, range.paddr, pte);
 }
 
 void
