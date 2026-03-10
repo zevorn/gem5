@@ -168,6 +168,8 @@ class PM4PacketProcessor : public DmaVirtDevice
     void switchBuffer(PM4Queue *q, PM4SwitchBuf *pkt);
     void setUconfigReg(PM4Queue *q, PM4SetUconfigReg *pkt);
     void waitRegMem(PM4Queue *q, PM4WaitRegMem *pkt);
+    void waitRegMemPoll(PM4Queue *q, PM4WaitRegMem *pkt);
+    void waitRegMemMemDone(PM4Queue *q, PM4WaitRegMem *pkt, uint32_t value);
     void queryStatus(PM4Queue *q, PM4QueryStatus *pkt);
     void queryStatusDone(PM4Queue *q, PM4QueryStatus *pkt);
 

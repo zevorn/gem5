@@ -38,6 +38,14 @@
 namespace gem5
 {
 
+namespace
+{
+
+constexpr Addr mmGPU_HDP_FLUSH_REQ = 0x0e26 << 2;
+constexpr Addr mmGPU_HDP_FLUSH_DONE = 0x0e27 << 2;
+
+} // namespace
+
 AMDGPUNbio::AMDGPUNbio()
 {
     // All read-before-write MMIOs go here
@@ -194,6 +202,12 @@ AMDGPUNbio::writeMMIO(PacketPtr pkt, Addr offset)
     } else if (offset == AMDGPU_MP0_SMN_C2PMSG_64) {
         triggered_reads[AMDGPU_MP0_SMN_C2PMSG_64] =
             0x80000000 + pkt->getLE<uint32_t>();
+    } else if (offset == mmGPU_HDP_FLUSH_REQ) {
+        const uint32_t value = pkt->getLE<uint32_t>();
+        regs[offset] = value;
+        // Model HDP flush completion immediately so CP/SDMA ring bring-up
+        // can observe the requested DONE bits.
+        regs[mmGPU_HDP_FLUSH_DONE] = value;
     } else if (offset == AMDGPU_MP0_SMN_C2PMSG_69) {
         // PSP ring low addr
         psp_ring = insertBits(psp_ring, 31, 0, pkt->getLE<uint32_t>());

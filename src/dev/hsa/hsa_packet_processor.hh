@@ -322,6 +322,14 @@ class HSAPacketProcessor: public DmaVirtDevice
         return regdQList.at(queId);
     }
 
+    bool
+    hasQueueContext(uint32_t queId) const
+    {
+        return queId < regdQList.size() && regdQList[queId] != nullptr &&
+               regdQList[queId]->qCntxt.qDesc != nullptr &&
+               regdQList[queId]->qCntxt.aqlBuf != nullptr;
+    }
+
     uint64_t
     inFlightPkts(uint32_t queId)
     {

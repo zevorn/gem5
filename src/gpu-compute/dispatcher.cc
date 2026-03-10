@@ -307,17 +307,25 @@ GPUDispatcher::notifyWgCompl(Wavefront *wf)
         curTick(), wf->wgId, kern_id, wf->computeUnit->cu_id);
 
     if (task->numWgCompleted() == task->numWgTotal()) {
-        // Notify the HSA PP that this kernel is complete
-        gpuCmdProc->hsaPacketProc()
-            .finishPkt(task->dispPktPtr(), task->queueId());
-        if (task->completionSignal()) {
-            DPRINTF(GPUDisp, "HSA AQL Kernel Complete with completion "
-                    "signal! Addr: %d\n", task->completionSignal());
-
-            gpuCmdProc->sendCompletionSignal(task->completionSignal());
+        if (!gpuCmdProc->hsaPacketProc().hasQueueContext(task->queueId())) {
+            warn("Kernel %d completed after HSA queue %u teardown; "
+                 "skipping completion handling",
+                 kern_id, task->queueId());
         } else {
-            DPRINTF(GPUDisp, "HSA AQL Kernel Complete! No completion "
-                "signal\n");
+            // Notify the HSA PP that this kernel is complete
+            gpuCmdProc->hsaPacketProc().finishPkt(task->dispPktPtr(),
+                                                  task->queueId());
+            if (task->completionSignal()) {
+                DPRINTF(GPUDisp,
+                        "HSA AQL Kernel Complete with completion "
+                        "signal! Addr: %d\n",
+                        task->completionSignal());
+
+                gpuCmdProc->sendCompletionSignal(task->completionSignal());
+            } else {
+                DPRINTF(GPUDisp, "HSA AQL Kernel Complete! No completion "
+                                 "signal\n");
+            }
         }
 
         DPRINTF(GPUWgLatency, "Kernel Complete ticks:%d kernel:%d\n",

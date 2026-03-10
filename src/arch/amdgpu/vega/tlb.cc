@@ -46,6 +46,17 @@ namespace gem5
 namespace VegaISA
 {
 
+namespace
+{
+
+bool
+shouldAllocateTlbEntry(const VegaTlbEntry *entry)
+{
+    return entry && entry->pte.v;
+}
+
+} // anonymous namespace
+
 // we have no limit for the number of translations we send
 // downstream as we depend on the limit of the coalescer
 // above us
@@ -506,12 +517,15 @@ GpuTLB::handleTranslationReturn(Addr virt_page_addr,
         assert(new_entry);
         local_entry = new_entry;
 
-        if (allocationPolicy) {
-            assert(new_entry->pte);
+        if (allocationPolicy && shouldAllocateTlbEntry(new_entry)) {
             DPRINTF(GPUTLB, "allocating entry w/ addr %#lx of size %#lx\n",
                     virt_page_addr, new_entry->size());
 
             local_entry = insert(virt_page_addr, *new_entry);
+        } else if (allocationPolicy) {
+            warn_once("GpuTLB: skipping allocation for faulted translation "
+                      "at %#lx",
+                      virt_page_addr);
         }
 
         assert(local_entry);

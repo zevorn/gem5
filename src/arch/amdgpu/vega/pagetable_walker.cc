@@ -207,14 +207,27 @@ Walker::WalkerState::startWalk()
                     read->getAddr());
             sendPackets();
         } else {
-            // Set physical page address in entry
-            entry.paddr = entry.pte.ppn << PageShift;
-            entry.paddr += entry.vaddr & mask(entry.logBytes);
-
-            // Insert to TLB
             assert(walker);
             assert(walker->tlb);
-            walker->tlb->insert(entry.vaddr, entry);
+
+            if (timingFault != NoFault || !entry.pte.v) {
+                warn_once("Cosim walker: faulted timing translation for "
+                          "vaddr %#lx mapped to sink",
+                          tlbPkt->req->getVaddr());
+                entry.vaddr = roundDown(tlbPkt->req->getVaddr(), PageBytes);
+                entry.paddr = 0;
+                entry.logBytes = PageShift;
+                entry.pte = 0;
+                entry.pte.r = 1;
+                entry.pte.w = 1;
+            } else {
+                // Set physical page address in entry
+                entry.paddr = entry.pte.ppn << PageShift;
+                entry.paddr += entry.vaddr & mask(entry.logBytes);
+
+                // Insert to TLB
+                walker->tlb->insert(entry.vaddr, entry);
+            }
 
             // Send translation return event
             walker->walkerResponse(this, entry, tlbPkt);

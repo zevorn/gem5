@@ -47,6 +47,23 @@
 namespace gem5
 {
 
+namespace
+{
+
+Addr
+sdmaPollRegWaitAddr(const sdmaPollRegMem *pkt)
+{
+    return bits(pkt->address, 31, 0);
+}
+
+Addr
+sdmaPollRegWriteAddr(const sdmaPollRegMem *pkt)
+{
+    return bits(pkt->address, 63, 32);
+}
+
+} // namespace
+
 SDMAEngine::SDMAEngine(const SDMAEngineParams &p)
     : DmaVirtDevice(p), id(0), gfxBase(0), gfxRptr(0),
       gfxDoorbell(0), gfxDoorbellOffset(0), gfxWptr(0), pageBase(0),
@@ -117,9 +134,25 @@ SDMAEngine::getGARTAddr(Addr addr) const
     return addr;
 }
 
+bool
+SDMAEngine::isRawVRAMAddress(Addr raw_addr) const
+{
+    return raw_addr < gpuDevice->getVRAMSize();
+}
+
 Addr
 SDMAEngine::getDeviceAddress(Addr raw_addr)
 {
+    if (cur_vmid == 0) {
+        if (gpuDevice->getVM().inMMHUB(raw_addr)) {
+            return raw_addr - gpuDevice->getVM().getMMHUBBase();
+        }
+
+        if (isRawVRAMAddress(raw_addr)) {
+            return raw_addr;
+        }
+    }
+
     // SDMA packets can access both host and device memory as either a source
     // or destination address. We don't know which until it is translated, so
     // we do a dummy functional translation to determine if the address
@@ -138,13 +171,8 @@ SDMAEngine::getDeviceAddress(Addr raw_addr)
     // return an MMHUB address, then we can similarly subtract the base to
     // get the device address. Otherwise, for host, device address is 0.
     Addr device_addr = 0;
-    if ((gpuDevice->getVM().inMMHUB(raw_addr) && cur_vmid == 0) ||
-        (gpuDevice->getVM().inMMHUB(tmp_addr) && cur_vmid != 0)) {
-        if (cur_vmid == 0) {
-            device_addr = raw_addr - gpuDevice->getVM().getMMHUBBase();
-        } else {
-            device_addr = tmp_addr - gpuDevice->getVM().getMMHUBBase();
-        }
+    if (gpuDevice->getVM().inMMHUB(tmp_addr) && cur_vmid != 0) {
+        device_addr = tmp_addr - gpuDevice->getVM().getMMHUBBase();
     }
 
     return device_addr;
@@ -663,16 +691,15 @@ SDMAEngine::writeReadData(SDMAQueue *q, sdmaWrite *pkt, uint32_t *dmaBuffer)
     }
 
     // lastly we write read data to the destination address
-    if (gpuDevice->getVM().inMMHUB(pkt->dest)) {
-        Addr mmhub_addr = pkt->dest - gpuDevice->getVM().getMMHUBBase();
-
-        fatal_if(gpuDevice->getVM().inGARTRange(mmhub_addr),
-                "SDMA write to GART not implemented");
+    Addr device_addr = getDeviceAddress(pkt->dest);
+    if (device_addr) {
+        fatal_if(gpuDevice->getVM().inGARTRange(device_addr),
+                 "SDMA write to GART not implemented");
 
         auto cb = new EventFunctionWrapper(
             [ = ]{ writeDone(q, pkt, dmaBuffer); }, name());
-        gpuDevice->getMemMgr()->writeRequest(mmhub_addr, (uint8_t *)dmaBuffer,
-                                           bufferSize, 0, cb);
+        gpuDevice->getMemMgr()->writeRequest(device_addr, (uint8_t *)dmaBuffer,
+                                             bufferSize, 0, cb);
     } else {
         if (q->priv() && cur_vmid == 0) {
             pkt->dest = getGARTAddr(pkt->dest);
@@ -723,7 +750,7 @@ SDMAEngine::copy(SDMAQueue *q, sdmaCopy *pkt)
     pkt->count++;
 
     if (q->priv() && cur_vmid == 0) {
-        if (!gpuDevice->getVM().inMMHUB(pkt->source)) {
+        if (!getDeviceAddress(pkt->source)) {
             DPRINTF(SDMAEngine, "Getting GART addr for %lx\n", pkt->source);
             pkt->source = getGARTAddr(pkt->source);
             DPRINTF(SDMAEngine, "GART addr %lx\n", pkt->source);
@@ -878,14 +905,28 @@ void
 SDMAEngine::fence(SDMAQueue *q, sdmaFence *pkt)
 {
     q->incRptr(sizeof(sdmaFence));
-    if (q->priv() && cur_vmid == 0) {
-        pkt->dest = getGARTAddr(pkt->dest);
-    }
+    Addr device_addr = getDeviceAddress(pkt->dest);
+    if (device_addr) {
+        auto *buf = new uint32_t(pkt->data);
+        auto cb = new EventFunctionWrapper(
+            [=] {
+                delete buf;
+                fenceDone(q, pkt);
+            },
+            name());
+        gpuDevice->getMemMgr()->writeRequest(device_addr,
+                                             reinterpret_cast<uint8_t *>(buf),
+                                             sizeof(*buf), 0, cb);
+    } else {
+        if (q->priv() && cur_vmid == 0) {
+            pkt->dest = getGARTAddr(pkt->dest);
+        }
 
-    // Writing the data from the fence packet to the destination address.
-    auto cb = new DmaVirtCallback<uint32_t>(
-        [ = ] (const uint32_t &) { fenceDone(q, pkt); }, pkt->data);
-    dmaWriteVirt(pkt->dest, sizeof(pkt->data), cb, &cb->dmaBuffer);
+        // Writing the data from the fence packet to the destination address.
+        auto cb = new DmaVirtCallback<uint32_t>(
+            [=](const uint32_t &) { fenceDone(q, pkt); }, pkt->data);
+        dmaWriteVirt(pkt->dest, sizeof(pkt->data), cb, &cb->dmaBuffer);
+    }
 }
 
 /* Completion of a fence packet. */
@@ -977,36 +1018,123 @@ SDMAEngine::pollRegMem(SDMAQueue *q, uint32_t header, sdmaPollRegMem *pkt)
     sdmaPollRegMemHeader prm_header;
     prm_header.ordinal = header;
 
-    if (q->priv() && cur_vmid == 0) {
-        pkt->address = getGARTAddr(pkt->address);
-    }
-
     DPRINTF(SDMAEngine, "POLL_REGMEM: M=%d, func=%d, op=%d, addr=%p, ref=%d, "
             "mask=%p, retry=%d, pinterval=%d\n", prm_header.mode,
             prm_header.func, prm_header.op, pkt->address, pkt->ref, pkt->mask,
             pkt->retryCount, pkt->pollInt);
 
-    bool skip = false;
-
     if (prm_header.mode == 1) {
         // polling on a memory location
         if (prm_header.op == 0) {
-            auto cb = new DmaVirtCallback<uint32_t>(
-                [ = ] (const uint32_t &dma_buffer) {
-                    pollRegMemRead(q, header, pkt, dma_buffer, 0); });
-            dmaReadVirt(pkt->address, sizeof(uint32_t), cb,
-                        (void *)&cb->dmaBuffer, sdma_delay);
+            Addr device_addr = getDeviceAddress(pkt->address);
+            if (device_addr) {
+                auto *value = new uint32_t(0);
+                auto cb = new EventFunctionWrapper(
+                    [=] {
+                        const uint32_t read_value = *value;
+                        delete value;
+                        pollRegMemValue(q, header, pkt, read_value, 0);
+                    },
+                    name());
+                gpuDevice->getMemMgr()->readRequest(
+                    device_addr, reinterpret_cast<uint8_t *>(value),
+                    sizeof(*value), 0, cb);
+            } else {
+                if (q->priv() && cur_vmid == 0) {
+                    pkt->address = getGARTAddr(pkt->address);
+                }
+                auto cb = new DmaVirtCallback<uint32_t>(
+                    [=](const uint32_t &dma_buffer) {
+                        pollRegMemValue(q, header, pkt, dma_buffer, 0);
+                    });
+                dmaReadVirt(pkt->address, sizeof(uint32_t), cb,
+                            (void *)&cb->dmaBuffer, sdma_delay);
+            }
         } else {
             panic("SDMA poll mem operation not implemented.");
-            skip = true;
         }
     } else {
-        warn_once("SDMA poll reg is not implemented. If this is required for "
-                  "correctness, an SRBM model needs to be implemented.");
-        skip = true;
-    }
+        if (prm_header.op == 1) {
+            const Addr write_reg = sdmaPollRegWriteAddr(pkt);
+            DPRINTF(SDMAEngine,
+                    "SDMA poll reg write-before-wait reg %p <= %#x\n",
+                    write_reg, pkt->ref);
+            gpuDevice->setRegVal(write_reg, pkt->ref);
+        } else if (prm_header.op != 0) {
+            warn("SDMA poll reg operation %u not implemented, treating as "
+                 "plain wait",
+                 prm_header.op);
+        }
 
-    if (skip) {
+        const Addr wait_reg = sdmaPollRegWaitAddr(pkt);
+        pollRegMemValue(q, header, pkt, gpuDevice->getRegVal(wait_reg), 0);
+    }
+}
+
+void
+SDMAEngine::pollRegMemValue(SDMAQueue *q, uint32_t header, sdmaPollRegMem *pkt,
+                            uint32_t value, int count)
+{
+    sdmaPollRegMemHeader prm_header;
+    prm_header.ordinal = header;
+
+    const uint32_t masked_value = value & pkt->mask;
+    const uint32_t masked_ref = pkt->ref & pkt->mask;
+
+    if (!pollRegMemFunc(masked_value, masked_ref, prm_header.func) &&
+        ((count < (pkt->retryCount + 1) && pkt->retryCount != 0xfff) ||
+         pkt->retryCount == 0xfff)) {
+        if (prm_header.mode == 1) {
+            DPRINTF(SDMAEngine,
+                    "SDMA polling mem addr %p, val %#x ref %#x mask %#x.\n",
+                    pkt->address, value, pkt->ref, pkt->mask);
+
+            Addr device_addr = getDeviceAddress(pkt->address);
+            if (device_addr) {
+                auto *next_value = new uint32_t(0);
+                auto cb = new EventFunctionWrapper(
+                    [=] {
+                        const uint32_t read_value = *next_value;
+                        delete next_value;
+                        pollRegMemValue(q, header, pkt, read_value, count + 1);
+                    },
+                    name());
+                gpuDevice->getMemMgr()->readRequest(
+                    device_addr, reinterpret_cast<uint8_t *>(next_value),
+                    sizeof(*next_value), 0, cb);
+            } else {
+                auto cb = new DmaVirtCallback<uint32_t>(
+                    [=](const uint32_t &dma_buffer) {
+                        pollRegMemValue(q, header, pkt, dma_buffer, count + 1);
+                    });
+                dmaReadVirt(pkt->address, sizeof(uint32_t), cb,
+                            (void *)&cb->dmaBuffer, sdma_delay);
+            }
+        } else {
+            const Addr wait_reg = sdmaPollRegWaitAddr(pkt);
+            DPRINTF(SDMAEngine,
+                    "SDMA polling reg addr %p, val %#x ref %#x mask %#x.\n",
+                    wait_reg, value, pkt->ref, pkt->mask);
+            auto cb = new EventFunctionWrapper(
+                [=] {
+                    pollRegMemValue(q, header, pkt,
+                                    gpuDevice->getRegVal(wait_reg), count + 1);
+                },
+                name());
+            schedule(cb, curTick() + sdma_delay);
+        }
+    } else {
+        if (prm_header.mode == 1) {
+            DPRINTF(SDMAEngine,
+                    "SDMA polling mem addr %p, val %#x ref %#x done.\n",
+                    pkt->address, value, pkt->ref);
+        } else {
+            const Addr wait_reg = sdmaPollRegWaitAddr(pkt);
+            DPRINTF(SDMAEngine,
+                    "SDMA polling reg addr %p, val %#x ref %#x done.\n",
+                    wait_reg, value, pkt->ref);
+        }
+
         delete pkt;
         decodeNext(q);
     }
@@ -1016,32 +1144,7 @@ void
 SDMAEngine::pollRegMemRead(SDMAQueue *q, uint32_t header, sdmaPollRegMem *pkt,
                            uint32_t dma_buffer, int count)
 {
-    sdmaPollRegMemHeader prm_header;
-    prm_header.ordinal = header;
-
-    assert(prm_header.mode == 1 && prm_header.op == 0);
-
-    if (!pollRegMemFunc(dma_buffer, pkt->ref, prm_header.func) &&
-        ((count < (pkt->retryCount + 1) && pkt->retryCount != 0xfff) ||
-         pkt->retryCount == 0xfff)) {
-
-        // continue polling on a memory location until reference value is met,
-        // retryCount is met or indefinitelly if retryCount is 0xfff
-        DPRINTF(SDMAEngine, "SDMA polling mem addr %p, val %d ref %d.\n",
-                pkt->address, dma_buffer, pkt->ref);
-
-        auto cb = new DmaVirtCallback<uint32_t>(
-            [ = ] (const uint32_t &dma_buffer) {
-                pollRegMemRead(q, header, pkt, dma_buffer, count + 1); });
-        dmaReadVirt(pkt->address, sizeof(uint32_t), cb,
-                    (void *)&cb->dmaBuffer, sdma_delay);
-    } else {
-        DPRINTF(SDMAEngine, "SDMA polling mem addr %p, val %d ref %d done.\n",
-                pkt->address, dma_buffer, pkt->ref);
-
-        delete pkt;
-        decodeNext(q);
-    }
+    pollRegMemValue(q, header, pkt, dma_buffer, count);
 }
 
 bool
@@ -1093,15 +1196,14 @@ SDMAEngine::ptePde(SDMAQueue *q, sdmaPtePde *pkt)
     }
 
     // Writing generated data to the destination address.
-    if (gpuDevice->getVM().inMMHUB(pkt->dest)) {
-        Addr mmhub_addr = pkt->dest - gpuDevice->getVM().getMMHUBBase();
-
-        fatal_if(gpuDevice->getVM().inGARTRange(mmhub_addr),
-                "SDMA write to GART not implemented");
+    Addr device_addr = getDeviceAddress(pkt->dest);
+    if (device_addr) {
+        fatal_if(gpuDevice->getVM().inGARTRange(device_addr),
+                 "SDMA write to GART not implemented");
 
         auto cb = new EventFunctionWrapper(
             [ = ]{ ptePdeDone(q, pkt, dmaBuffer); }, name());
-        gpuDevice->getMemMgr()->writeRequest(mmhub_addr, (uint8_t *)dmaBuffer,
+        gpuDevice->getMemMgr()->writeRequest(device_addr, (uint8_t *)dmaBuffer,
                                              sizeof(uint64_t) * pkt->count, 0,
                                              cb);
     } else {
@@ -1516,9 +1618,7 @@ SDMAEngine::writeMMIO(PacketPtr pkt, Addr mmio_offset)
         }
         break;
       case mmSDMA_GFX_RB_CNTL: {
-        uint32_t rb_size = bits(pkt->getLE<uint32_t>(), 6, 1);
-        assert(rb_size >= 6 && rb_size <= 62);
-        setGfxSize(1 << (rb_size + 2));
+          setGfxSize(pkt->getLE<uint32_t>());
       } break;
       case mmSDMA_GFX_RB_WPTR_POLL_ADDR_LO:
         setGfxWptrLo(pkt->getLE<uint32_t>());
@@ -1548,9 +1648,7 @@ SDMAEngine::writeMMIO(PacketPtr pkt, Addr mmio_offset)
         }
         break;
       case mmSDMA_PAGE_RB_CNTL: {
-        uint32_t rb_size = bits(pkt->getLE<uint32_t>(), 6, 1);
-        assert(rb_size >= 6 && rb_size <= 62);
-        setPageSize(1 << (rb_size + 2));
+          setPageSize(pkt->getLE<uint32_t>());
       } break;
       case mmSDMA_PAGE_RB_WPTR_POLL_ADDR_LO:
         setPageWptrLo(pkt->getLE<uint32_t>());
@@ -1638,7 +1736,18 @@ void
 SDMAEngine::setGfxSize(uint32_t data)
 {
     uint32_t rb_size = bits(data, 6, 1);
-    assert(rb_size >= 6 && rb_size <= 62);
+
+    if (rb_size == 0) {
+        DPRINTF(SDMAEngine, "Clearing gfx ring size via RB_CNTL %#x\n", data);
+        gfx.size(0);
+        return;
+    }
+
+    if (rb_size < 6 || rb_size > 62) {
+        warn("Ignoring invalid SDMA gfx ring size encoding %#x", data);
+        return;
+    }
+
     gfx.size(1 << (rb_size + 2));
 }
 
@@ -1732,7 +1841,18 @@ void
 SDMAEngine::setPageSize(uint32_t data)
 {
     uint32_t rb_size = bits(data, 6, 1);
-    assert(rb_size >= 6 && rb_size <= 62);
+
+    if (rb_size == 0) {
+        DPRINTF(SDMAEngine, "Clearing page ring size via RB_CNTL %#x\n", data);
+        page.size(0);
+        return;
+    }
+
+    if (rb_size < 6 || rb_size > 62) {
+        warn("Ignoring invalid SDMA page ring size encoding %#x", data);
+        return;
+    }
+
     page.size(1 << (rb_size + 2));
 }
 

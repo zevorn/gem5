@@ -666,6 +666,12 @@ AQLRingBuffer::allocEntry(uint32_t nBufReq)
 void
 HSAPacketProcessor::finishPkt(void *pvPkt, uint32_t rl_idx)
 {
+    if (!hasQueueContext(rl_idx)) {
+        warn("Dropping packet completion for torn-down HSA queue %u (pkt=%p)",
+             rl_idx, pvPkt);
+        return;
+    }
+
     HSAQueueDescriptor* qDesc = regdQList[rl_idx]->qCntxt.qDesc;
 
     // if barrier bit was set and this is the last

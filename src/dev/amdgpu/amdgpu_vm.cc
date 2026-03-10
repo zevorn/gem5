@@ -46,6 +46,34 @@
 namespace gem5
 {
 
+namespace
+{
+
+constexpr Addr kInvalidateEngineCount = 18;
+
+bool
+inRegisterRange(Addr offset, Addr last_reg)
+{
+    return offset >= (last_reg - (kInvalidateEngineCount - 1)) &&
+           offset <= last_reg;
+}
+
+bool
+isInvalidateSemReg(Addr offset)
+{
+    return inRegisterRange(offset, mmMMHUB_VM_INVALIDATE_ENG17_SEM);
+}
+
+bool
+isInvalidateAckReg(Addr offset)
+{
+    return inRegisterRange(offset, mmMMHUB_VM_INVALIDATE_ENG17_ACK) ||
+           inRegisterRange(offset, mmVM_INVALIDATE_ENG17_ACK) ||
+           inRegisterRange(offset, MI300X_VM_INVALIDATE_ENG17_ACK);
+}
+
+} // namespace
+
 AMDGPUVM::AMDGPUVM()
 {
     // Zero out contexts
@@ -130,6 +158,20 @@ AMDGPUVM::readMMIO(PacketPtr pkt, Addr offset)
         pkt->setLE<uint32_t>(1);
         break;
       default:
+          if (isInvalidateSemReg(offset)) {
+              DPRINTF(AMDGPUDevice, "Marking invalidate SEM %#x acquired\n",
+                      offset);
+              pkt->setLE<uint32_t>(1);
+              break;
+          }
+
+          if (isInvalidateAckReg(offset)) {
+              DPRINTF(AMDGPUDevice, "Overwriting invalidate ACK %#x\n",
+                      offset);
+              pkt->setLE<uint32_t>(1);
+              break;
+          }
+
         DPRINTF(AMDGPUDevice, "GPUVM read of unknown MMIO %#x\n", offset);
         break;
     }

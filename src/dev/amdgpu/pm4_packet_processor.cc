@@ -32,6 +32,8 @@
 
 #include "dev/amdgpu/pm4_packet_processor.hh"
 
+#include <algorithm>
+
 #include "debug/PM4PacketProcessor.hh"
 #include "dev/amdgpu/amdgpu_device.hh"
 #include "dev/amdgpu/hwreg_defines.hh"
@@ -48,6 +50,66 @@
 
 namespace gem5
 {
+
+namespace
+{
+
+constexpr uint32_t WaitRegMemFunctionAlways = 0;
+constexpr uint32_t WaitRegMemFunctionLessThan = 1;
+constexpr uint32_t WaitRegMemFunctionLessThanEqual = 2;
+constexpr uint32_t WaitRegMemFunctionEqual = 3;
+constexpr uint32_t WaitRegMemFunctionNotEqual = 4;
+constexpr uint32_t WaitRegMemFunctionGreaterThanEqual = 5;
+constexpr uint32_t WaitRegMemFunctionGreaterThan = 6;
+
+constexpr uint32_t WaitRegMemMemSpaceRegister = 0;
+constexpr uint32_t WaitRegMemMemSpaceMemory = 1;
+
+constexpr uint32_t WaitRegMemOperationWait = 0;
+constexpr uint32_t WaitRegMemOperationWriteWaitWriteReg = 1;
+constexpr uint32_t WaitRegMemOperationWaitMemPreemptable = 3;
+
+bool
+waitRegMemSatisfied(const PM4WaitRegMem *pkt, uint32_t value)
+{
+    const uint32_t masked_value = value & pkt->mask;
+    const uint32_t masked_reference = pkt->reference & pkt->mask;
+
+    switch (pkt->function) {
+        case WaitRegMemFunctionAlways:
+            return true;
+        case WaitRegMemFunctionLessThan:
+            return masked_value < masked_reference;
+        case WaitRegMemFunctionLessThanEqual:
+            return masked_value <= masked_reference;
+        case WaitRegMemFunctionEqual:
+            return masked_value == masked_reference;
+        case WaitRegMemFunctionNotEqual:
+            return masked_value != masked_reference;
+        case WaitRegMemFunctionGreaterThanEqual:
+            return masked_value >= masked_reference;
+        case WaitRegMemFunctionGreaterThan:
+            return masked_value > masked_reference;
+        default:
+            warn("Unsupported WAIT_REG_MEM function %u, treating as not ready",
+                 pkt->function);
+            return false;
+    }
+}
+
+Tick
+waitRegMemNextPollTick(PM4PacketProcessor *proc, const PM4WaitRegMem *pkt)
+{
+    return proc->clockEdge(Cycles(std::max<uint32_t>(1, pkt->pollInterval)));
+}
+
+Addr
+waitRegMemMemAddr(const PM4WaitRegMem *pkt)
+{
+    return (static_cast<Addr>(pkt->memAddrHi) << 32) | pkt->memAddrLo;
+}
+
+} // namespace
 
 PM4PacketProcessor::PM4PacketProcessor(const PM4PacketProcessorParams &p)
     : DmaVirtDevice(p), _ipId(p.ip_id), _mmioRange(p.mmio_range)
@@ -915,8 +977,98 @@ PM4PacketProcessor::waitRegMem(PM4Queue *q, PM4WaitRegMem *pkt)
     DPRINTF(PM4PacketProcessor, "    Mask: %lx\n", pkt->mask);
     DPRINTF(PM4PacketProcessor, "    Poll Interval: %lx\n", pkt->pollInterval);
 
-    delete pkt;
-    decodeNext(q);
+    if (pkt->operation == WaitRegMemOperationWriteWaitWriteReg) {
+        if (pkt->memSpace != WaitRegMemMemSpaceRegister) {
+            warn("WAIT_REG_MEM op=1 is only implemented for register space");
+        } else {
+            const Addr reg_addr = static_cast<Addr>(pkt->regAddr1) << 2;
+            DPRINTF(PM4PacketProcessor,
+                    "WAIT_REG_MEM write-before-wait reg %p <= %x\n", reg_addr,
+                    pkt->reference);
+            gpuDevice->setRegVal(reg_addr, pkt->reference);
+        }
+    } else if (pkt->operation != WaitRegMemOperationWait &&
+               pkt->operation != WaitRegMemOperationWaitMemPreemptable) {
+        warn("WAIT_REG_MEM operation %u not implemented, treating as wait",
+             pkt->operation);
+    }
+
+    waitRegMemPoll(q, pkt);
+}
+
+void
+PM4PacketProcessor::waitRegMemPoll(PM4Queue *q, PM4WaitRegMem *pkt)
+{
+    if (pkt->memSpace == WaitRegMemMemSpaceMemory) {
+        const Addr addr = waitRegMemMemAddr(pkt);
+
+        if (isVRAMAddress(addr)) {
+            auto *value = new uint32_t(0);
+            auto cb = new EventFunctionWrapper(
+                [=] {
+                    const uint32_t read_value = *value;
+                    delete value;
+                    waitRegMemMemDone(q, pkt, read_value);
+                },
+                name());
+            gpuDevice->getMemMgr()->readRequest(
+                addr, reinterpret_cast<uint8_t *>(value), sizeof(*value), 0,
+                cb);
+        } else {
+            Addr gart_addr = getGARTAddr(addr);
+            auto cb =
+                new DmaVirtCallback<uint32_t>([=](const uint32_t &value) {
+                    waitRegMemMemDone(q, pkt, value);
+                });
+            dmaReadVirt(gart_addr, sizeof(uint32_t), cb, &cb->dmaBuffer);
+        }
+        return;
+    }
+
+    Addr reg_addr = static_cast<Addr>(pkt->regAddr1) << 2;
+    if (pkt->operation == WaitRegMemOperationWriteWaitWriteReg) {
+        reg_addr = static_cast<Addr>(pkt->regAddr2) << 2;
+    }
+
+    const uint32_t value = gpuDevice->getRegVal(reg_addr);
+    if (waitRegMemSatisfied(pkt, value)) {
+        DPRINTF(PM4PacketProcessor,
+                "WAIT_REG_MEM satisfied at reg %p with value %#x\n", reg_addr,
+                value);
+        delete pkt;
+        decodeNext(q);
+        return;
+    }
+
+    DPRINTF(PM4PacketProcessor,
+            "WAIT_REG_MEM retry for reg %p value %#x ref %#x mask %#x\n",
+            reg_addr, value, pkt->reference, pkt->mask);
+    auto cb =
+        new EventFunctionWrapper([=] { waitRegMemPoll(q, pkt); }, name());
+    schedule(cb, waitRegMemNextPollTick(this, pkt));
+}
+
+void
+PM4PacketProcessor::waitRegMemMemDone(PM4Queue *q, PM4WaitRegMem *pkt,
+                                      uint32_t value)
+{
+    const Addr addr = waitRegMemMemAddr(pkt);
+
+    if (waitRegMemSatisfied(pkt, value)) {
+        DPRINTF(PM4PacketProcessor,
+                "WAIT_REG_MEM satisfied at mem %p with value %#x\n", addr,
+                value);
+        delete pkt;
+        decodeNext(q);
+        return;
+    }
+
+    DPRINTF(PM4PacketProcessor,
+            "WAIT_REG_MEM retry for mem %p value %#x ref %#x mask %#x\n", addr,
+            value, pkt->reference, pkt->mask);
+    auto cb =
+        new EventFunctionWrapper([=] { waitRegMemPoll(q, pkt); }, name());
+    schedule(cb, waitRegMemNextPollTick(this, pkt));
 }
 
 void

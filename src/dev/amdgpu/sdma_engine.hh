@@ -199,6 +199,7 @@ class SDMAEngine : public DmaVirtDevice
      * packet is on the host/system memory.
      */
     Addr getDeviceAddress(Addr raw_addr);
+    bool isRawVRAMAddress(Addr raw_addr) const;
 
     /**
      * Inherited methods.
@@ -252,6 +253,8 @@ class SDMAEngine : public DmaVirtDevice
     void trap(SDMAQueue *q, sdmaTrap *pkt);
     void srbmWrite(SDMAQueue *q, uint32_t header, sdmaSRBMWrite *pkt);
     void pollRegMem(SDMAQueue *q, uint32_t header, sdmaPollRegMem *pkt);
+    void pollRegMemValue(SDMAQueue *q, uint32_t header, sdmaPollRegMem *pkt,
+                         uint32_t value, int count);
     void pollRegMemRead(SDMAQueue *q, uint32_t header, sdmaPollRegMem *pkt,
                         uint32_t dma_buffer, int count);
     bool pollRegMemFunc(uint32_t value, uint32_t reference, uint32_t func);
