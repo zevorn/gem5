@@ -9,6 +9,7 @@
 #include "base/trace.hh"
 #include "debug/XGMIBridge.hh"
 #include "dev/amdgpu/amdgpu_device.hh"
+#include "sim/system.hh"
 
 namespace gem5
 {
@@ -17,15 +18,41 @@ XGMIBridge::XGMIBridge(const Params &p)
     : SimObject(p),
       gpuDevice(p.gpu_device),
       gpuId(p.gpu_id),
-      bandwidth(p.bandwidth),
-      latencyTicks(p.latency),
+      numGpus(p.num_gpus),
+      bandwidthBps(p.bandwidth),
+      linkLatency(p.latency),
       numLanes(p.num_lanes),
       maxLinks(p.max_links),
       creditCount(p.credit_count),
-      vramSizePerGpu(p.vram_size_per_gpu)
+      vramSizePerGpu(p.vram_size_per_gpu),
+      deliveryEvent([this] { /* batch event placeholder */ }, name())
 {
-    DPRINTF(XGMIBridge, "XGMIBridge: GPU %d, BW=%lu B/s, lat=%lu ticks\n",
-            gpuId, bandwidth, latencyTicks);
+    DPRINTF(XGMIBridge,
+            "GPU %d: BW=%lu B/s, latency=%lu ticks, "
+            "credits=%d, VRAM/GPU=%lu\n",
+            gpuId, bandwidthBps, linkLatency, creditCount, vramSizePerGpu);
+}
+
+void
+XGMIBridge::init()
+{
+    SimObject::init();
+
+    // Build peer table from configuration parameter
+    credits.resize(numGpus, creditCount);
+    sendQueues.resize(numGpus);
+
+    for (auto *peer : p.peers) {
+        int peerId = peer->gpuId;
+        if (peerId >= 0 && peerId < numGpus && peerId != gpuId) {
+            if (static_cast<int>(peers.size()) <= peerId) {
+                peers.resize(peerId + 1, nullptr);
+            }
+            peers[peerId] = peer;
+            DPRINTF(XGMIBridge, "GPU %d: peer GPU %d registered\n", gpuId,
+                    peerId);
+        }
+    }
 }
 
 bool
@@ -42,56 +69,121 @@ XGMIBridge::getDestGpu(Addr addr) const
     return static_cast<int>(addr / vramSizePerGpu);
 }
 
-void
-XGMIBridge::addPeer(XGMIBridge *peer)
+bool
+XGMIBridge::sendPacket(XGMIPacket pkt)
 {
-    int peerId = peer->gpuId;
-    if (static_cast<int>(peers.size()) <= peerId) {
-        peers.resize(peerId + 1, nullptr);
-        credits.resize(peerId + 1, creditCount);
+    int dst = pkt.dstGpu;
+
+    if (dst < 0 || dst >= numGpus || dst == gpuId) {
+        warn("XGMIBridge GPU %d: invalid destination GPU %d\n", gpuId, dst);
+        return false;
     }
-    peers[peerId] = peer;
-    DPRINTF(XGMIBridge, "XGMIBridge: GPU %d added peer GPU %d\n", gpuId,
-            peerId);
+
+    if (dst >= static_cast<int>(peers.size()) || !peers[dst]) {
+        warn("XGMIBridge GPU %d: no peer for GPU %d\n", gpuId, dst);
+        return false;
+    }
+
+    if (credits[dst] <= 0) {
+        DPRINTF(XGMIBridge, "GPU %d -> GPU %d: stalled (no credits)\n", gpuId,
+                dst);
+        return false;
+    }
+
+    credits[dst]--;
+
+    // Calculate transfer time based on bandwidth
+    Tick transferTime = linkLatency;
+    if (bandwidthBps > 0 && pkt.size > 0) {
+        Tick dataTime = (static_cast<Tick>(pkt.size) * sim_clock::as_int::s) /
+                        bandwidthBps;
+        transferTime += dataTime;
+    }
+
+    DPRINTF(XGMIBridge,
+            "GPU %d -> GPU %d: addr=0x%lx size=%u "
+            "credits=%d xfer_ticks=%lu\n",
+            gpuId, dst, pkt.addr, pkt.size, credits[dst], transferTime);
+
+    // Schedule delivery event on the destination bridge
+    peers[dst]->scheduleDelivery(std::move(pkt));
+
+    return true;
 }
 
 void
-XGMIBridge::sendPacket(const XGMIPacket &pkt, const uint8_t *data)
+XGMIBridge::scheduleDelivery(XGMIPacket pkt)
 {
-    if (pkt.dstGpu >= static_cast<int>(peers.size()) || !peers[pkt.dstGpu]) {
-        warn("XGMIBridge: GPU %d cannot reach GPU %d\n", gpuId, pkt.dstGpu);
-        return;
+    Tick deliverAt = curTick() + linkLatency;
+    if (bandwidthBps > 0 && pkt.size > 0) {
+        deliverAt += (static_cast<Tick>(pkt.size) * sim_clock::as_int::s) /
+                     bandwidthBps;
     }
 
-    if (credits[pkt.dstGpu] <= 0) {
-        DPRINTF(XGMIBridge,
-                "XGMIBridge: GPU %d -> GPU %d: "
-                "back-pressure (no credits)\n",
-                gpuId, pkt.dstGpu);
-        // Stall — caller must retry; packets are never dropped.
-        return;
-    }
+    // Store packet and schedule event
+    sendQueues[pkt.srcGpu].push(std::move(pkt));
 
-    credits[pkt.dstGpu]--;
-    DPRINTF(XGMIBridge,
-            "XGMIBridge: GPU %d -> GPU %d: "
-            "addr=0x%lx size=%u credits=%d\n",
-            gpuId, pkt.dstGpu, pkt.addr, pkt.size, credits[pkt.dstGpu]);
-
-    peers[pkt.dstGpu]->recvPacket(pkt, data);
+    // Use a per-packet event (simplified; production would use a queue drain)
+    auto *event = new EventFunctionWrapper(
+        [this, srcGpu = sendQueues[pkt.srcGpu].front().srcGpu] {
+            if (!sendQueues[srcGpu].empty()) {
+                auto p = std::move(sendQueues[srcGpu].front());
+                sendQueues[srcGpu].pop();
+                deliverPacket(std::move(p));
+            }
+        },
+        name(), true /* auto-delete */
+    );
+    schedule(event, deliverAt);
 }
 
 void
-XGMIBridge::recvPacket(const XGMIPacket &pkt, const uint8_t *data)
+XGMIBridge::deliverPacket(XGMIPacket pkt)
 {
     DPRINTF(XGMIBridge,
-            "XGMIBridge: GPU %d received from GPU %d: "
+            "GPU %d: delivering packet from GPU %d, "
             "addr=0x%lx size=%u\n",
             gpuId, pkt.srcGpu, pkt.addr, pkt.size);
 
-    // Return credit to sender
-    if (pkt.srcGpu < static_cast<int>(peers.size()) && peers[pkt.srcGpu]) {
-        peers[pkt.srcGpu]->credits[gpuId]++;
+    // Write payload to destination VRAM via device memory system
+    if (!pkt.payload.empty() && gpuDevice) {
+        Addr localAddr = gpuDevice->globalToLocalVRAM(pkt.addr);
+        auto *system = gpuDevice->cp->shader()->gpuCmdProc.system();
+
+        RequestPtr req = std::make_shared<Request>(
+            pkt.addr, pkt.size, 0, gpuDevice->vramRequestorId());
+        PacketPtr writePkt = Packet::createWrite(req);
+        writePkt->dataDynamic(new uint8_t[pkt.size]);
+        std::memcpy(writePkt->getPtr<uint8_t>(), pkt.payload.data(), pkt.size);
+
+        auto *devMem = system->getDeviceMemory(writePkt);
+        if (devMem) {
+            devMem->access(writePkt);
+            DPRINTF(XGMIBridge,
+                    "GPU %d: wrote %u bytes to VRAM "
+                    "addr=0x%lx (local=0x%lx)\n",
+                    gpuId, pkt.size, pkt.addr, localAddr);
+        } else {
+            warn("XGMIBridge GPU %d: no device memory for addr 0x%lx\n", gpuId,
+                 pkt.addr);
+        }
+        delete writePkt;
+    }
+
+    // Return credit to sender after delivery completes
+    returnCredit(pkt.srcGpu);
+}
+
+void
+XGMIBridge::returnCredit(int senderGpuId)
+{
+    if (senderGpuId >= 0 && senderGpuId < static_cast<int>(peers.size()) &&
+        peers[senderGpuId]) {
+        peers[senderGpuId]->credits[gpuId]++;
+        DPRINTF(XGMIBridge,
+                "GPU %d: returned credit to GPU %d "
+                "(now %d)\n",
+                gpuId, senderGpuId, peers[senderGpuId]->credits[gpuId]);
     }
 }
 

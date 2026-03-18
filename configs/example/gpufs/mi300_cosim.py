@@ -523,30 +523,34 @@ def buildCosimSystem(args):
         xgmi_bw = getattr(args, "xgmi_bandwidth", "128GBps")
         xgmi_lat = getattr(args, "xgmi_latency", "100ns")
 
+        # Create bridge objects (peers assigned after all are created)
         xgmi_bridges = []
         for gpu_id in range(num_gpus):
             xb = XGMIBridge(
                 gpu_device=gpu_devices[gpu_id],
                 gpu_id=gpu_id,
+                num_gpus=num_gpus,
                 bandwidth=xgmi_bw,
                 latency=xgmi_lat,
                 vram_size_per_gpu=args.dgpu_mem_size,
             )
             xgmi_bridges.append(xb)
 
-        # Connect peers based on topology
+        # Assign peers based on topology via SimObject parameters
         if xgmi_topo == "mesh":
             for i in range(num_gpus):
-                for j in range(num_gpus):
-                    if i != j:
-                        xgmi_bridges[i].addPeer(xgmi_bridges[j])
+                xgmi_bridges[i].peers = [
+                    xgmi_bridges[j] for j in range(num_gpus) if j != i
+                ]
         elif xgmi_topo == "ring":
             for i in range(num_gpus):
+                ring_peers = []
                 nxt = (i + 1) % num_gpus
                 prv = (i - 1) % num_gpus
-                xgmi_bridges[i].addPeer(xgmi_bridges[nxt])
+                ring_peers.append(xgmi_bridges[nxt])
                 if prv != nxt:
-                    xgmi_bridges[i].addPeer(xgmi_bridges[prv])
+                    ring_peers.append(xgmi_bridges[prv])
+                xgmi_bridges[i].peers = ring_peers
 
         system.xgmi_bridges = xgmi_bridges
 
@@ -584,6 +588,17 @@ if __name__ == "__m5_main__":
         args.dgpu_mem_size = "16GiB"
 
     num_gpus = getattr(args, "num_gpus", 1)
+
+    # Validate xGMI parameters at parse time
+    xgmi_topo = getattr(args, "xgmi_topology", None)
+    if xgmi_topo is not None and num_gpus < 2:
+        m5.util.panic("--xgmi-topology requires --num-gpus >= 2")
+    xgmi_bw = getattr(args, "xgmi_bandwidth", "128GBps")
+    if xgmi_bw == "0GBps" or xgmi_bw == "0":
+        m5.util.panic("--xgmi-bandwidth must be > 0")
+    xgmi_lat = getattr(args, "xgmi_latency", "100ns")
+    if xgmi_lat == "0ns" or xgmi_lat == "0":
+        m5.util.panic("--xgmi-latency must be > 0")
 
     system = buildCosimSystem(args)
 

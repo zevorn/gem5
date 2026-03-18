@@ -70,3 +70,9 @@ DebugFlag('PM4PacketProcessor', tags=['x86 isa'])
 DebugFlag('SDMAEngine', tags=['x86 isa'])
 DebugFlag('SDMAData', tags=['x86 isa'])
 DebugFlag('MI300XCosim', tags=['x86 isa'])
+
+# xGMI interconnect bridge for multi-GPU
+SimObject('XGMIBridge.py', sim_objects=['XGMIBridge'],
+                           tags=['x86 isa'])
+Source('xgmi_bridge.cc', tags=['x86 isa'])
+DebugFlag('XGMIBridge', tags=['x86 isa'])

@@ -177,6 +177,15 @@ class AMDGPUDevice : public PciEndpoint
     const int gpuId;
     Addr vramSize;
 
+    /**
+     * Multi-GPU VRAM address offset.
+     * Each GPU's VRAM occupies a distinct region in the global address
+     * space: [gpuId * vramSize, (gpuId+1) * vramSize).  Device-level
+     * code uses local offsets [0, vramSize); this offset is added when
+     * creating requests that enter the Ruby memory hierarchy.
+     */
+    Addr vramAddrOffset = 0;
+
   protected:
     /**
      * Methods inherited from PciEndpoint
@@ -267,6 +276,21 @@ class AMDGPUDevice : public PciEndpoint
     getVRAMSize() const
     {
         return vramSize;
+    }
+    Addr
+    getVRAMAddrOffset() const
+    {
+        return vramAddrOffset;
+    }
+    Addr
+    localToGlobalVRAM(Addr localAddr) const
+    {
+        return localAddr + vramAddrOffset;
+    }
+    Addr
+    globalToLocalVRAM(Addr globalAddr) const
+    {
+        return globalAddr - vramAddrOffset;
     }
 };
 

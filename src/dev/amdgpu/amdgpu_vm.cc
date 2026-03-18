@@ -620,10 +620,15 @@ AMDGPUVM::MMHUBTranslationGen::translate(Range &range) const
         next += AMDGPU_MMHUB_PAGE_SIZE;
 
     range.size = std::min(range.size, next - range.vaddr);
-    range.paddr = range.vaddr - vm->getMMHUBBase();
+    // Local offset within this GPU's VRAM
+    Addr localOffset = range.vaddr - vm->getMMHUBBase();
+    // Translate to global address for Ruby memory routing (multi-GPU)
+    range.paddr = vm->gpuDevice->localToGlobalVRAM(localOffset);
 
-    DPRINTF(AMDGPUDevice, "AMDGPUVM: MMHUB translation %#lx -> %#lx\n",
-            range.vaddr, range.paddr);
+    DPRINTF(AMDGPUDevice,
+            "AMDGPUVM: MMHUB translation %#lx -> %#lx "
+            "(GPU %d, local %#lx)\n",
+            range.vaddr, range.paddr, vm->gpuDevice->getGpuId(), localOffset);
 }
 
 void

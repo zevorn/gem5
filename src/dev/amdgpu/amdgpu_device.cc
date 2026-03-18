@@ -80,6 +80,7 @@ AMDGPUDevice::AMDGPUDevice(const AMDGPUDeviceParams &p)
     }
 
     vramSize = vram_size;
+    vramAddrOffset = static_cast<Addr>(gpuId) * vramSize;
 
     if (config().expansionROM) {
         romRange = RangeSize(config().expansionROM, ROM_SIZE);
@@ -480,8 +481,10 @@ AMDGPUDevice::readFrame(PacketPtr pkt, Addr offset)
      * because this method is called by the PCIEndpoint::read method which
      * is a non-timing read.
      */
-    RequestPtr req = std::make_shared<Request>(
-            offset, pkt->getSize(), 0, vramRequestorId());
+    // Translate local VRAM offset to global address for Ruby routing
+    Addr globalAddr = localToGlobalVRAM(offset);
+    RequestPtr req = std::make_shared<Request>(globalAddr, pkt->getSize(), 0,
+                                               vramRequestorId());
 
     PacketPtr readPkt = new Packet(req, MemCmd::ReadReq);
     uint8_t *dataPtr = new uint8_t[pkt->getSize()];
@@ -492,8 +495,8 @@ AMDGPUDevice::readFrame(PacketPtr pkt, Addr offset)
     if (readPkt->cmd == MemCmd::FunctionalReadError) {
         delete readPkt;
         delete[] dataPtr;
-        RequestPtr req = std::make_shared<Request>(offset, pkt->getSize(), 0,
-                                               vramRequestorId());
+        RequestPtr req = std::make_shared<Request>(globalAddr, pkt->getSize(),
+                                                   0, vramRequestorId());
         PacketPtr readPkt = Packet::createRead(req);
         uint8_t *dataPtr = new uint8_t[pkt->getSize()];
         readPkt->dataDynamic(dataPtr);
@@ -550,8 +553,10 @@ AMDGPUDevice::writeFrame(PacketPtr pkt, Addr offset)
     DPRINTF(AMDGPUDevice, "Wrote framebuffer address %#lx (size %d)\n", offset,
             pkt->getSize());
 
+    Addr globalOffset = localToGlobalVRAM(offset);
     for (auto& cu: CP()->shader()->cuList) {
-        Addr aligned_addr = offset & ~(gpuMemMgr->getCacheLineSize() - 1);
+        Addr aligned_addr =
+            globalOffset & ~(gpuMemMgr->getCacheLineSize() - 1);
         cu->sendInvL2(aligned_addr);
     }
 
@@ -572,7 +577,9 @@ AMDGPUDevice::writeFrame(PacketPtr pkt, Addr offset)
      * because this method is called by the PCIEndpoint::write method which
      * is a non-timing write.
      */
-    RequestPtr req = std::make_shared<Request>(offset, pkt->getSize(), 0,
+    // Translate local VRAM offset to global address for Ruby routing
+    Addr globalAddr = localToGlobalVRAM(offset);
+    RequestPtr req = std::make_shared<Request>(globalAddr, pkt->getSize(), 0,
                                                vramRequestorId());
     PacketPtr writePkt = Packet::createWrite(req);
     uint8_t *dataPtr = new uint8_t[pkt->getSize()];
@@ -582,13 +589,12 @@ AMDGPUDevice::writeFrame(PacketPtr pkt, Addr offset)
 
     auto system = cp->shader()->gpuCmdProc.system();
 
-    // If for some reason no device memory is found for this address, ignore
-    // the packet. This is an extremely rare situation and seems to only
-    // happen with one address that is not important, therefore warn only.
     if (system->getDeviceMemory(writePkt)) {
         system->getDeviceMemory(writePkt)->access(writePkt);
     } else {
-        warn("Unable to find device memory for address %#lx\n", offset);
+        warn("Unable to find device memory for address %#lx "
+             "(GPU %d, local offset %#lx)\n",
+             globalAddr, gpuId, offset);
     }
 
     delete writePkt;

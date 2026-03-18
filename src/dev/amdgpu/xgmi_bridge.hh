@@ -8,9 +8,11 @@
 #define __DEV_AMDGPU_XGMI_BRIDGE_HH__
 
 #include <cstdint>
+#include <queue>
 #include <vector>
 
 #include "params/XGMIBridge.hh"
+#include "sim/eventq.hh"
 #include "sim/sim_object.hh"
 
 namespace gem5
@@ -27,14 +29,15 @@ struct XGMIPacket
     uint8_t dstGpu;
     uint64_t addr;
     uint32_t size;
-    // payload follows header in actual transport
+    std::vector<uint8_t> payload;
 };
 
 /**
  * xGMI interconnect bridge attached to a GPU's L2 (TCC) egress.
  *
- * Routes remote VRAM accesses through the modeled xGMI link.
- * Local VRAM accesses bypass the bridge entirely.
+ * Routes remote VRAM accesses through the modeled xGMI link with
+ * bandwidth throttling, latency modeling via gem5 events, and
+ * credit-based flow control.
  */
 class XGMIBridge : public SimObject
 {
@@ -43,20 +46,19 @@ class XGMIBridge : public SimObject
     XGMIBridge(const Params &p);
     ~XGMIBridge() override = default;
 
+    void init() override;
+
     /** Check if an address targets a remote GPU's VRAM. */
     bool isRemoteAddr(Addr addr) const;
 
     /** Get the destination GPU ID for a remote address. */
     int getDestGpu(Addr addr) const;
 
-    /** Register a peer bridge for direct communication. */
-    void addPeer(XGMIBridge *peer);
-
-    /** Send a packet to a remote GPU via xGMI. */
-    void sendPacket(const XGMIPacket &pkt, const uint8_t *data);
-
-    /** Receive a packet from a remote GPU. */
-    void recvPacket(const XGMIPacket &pkt, const uint8_t *data);
+    /**
+     * Enqueue a packet for transmission to a remote GPU.
+     * Returns true if accepted, false if back-pressured (no credits).
+     */
+    bool sendPacket(XGMIPacket pkt);
 
     /** Available flow-control credits for a given destination. */
     int availableCredits(int dstGpu) const;
@@ -64,20 +66,36 @@ class XGMIBridge : public SimObject
   private:
     AMDGPUDevice *gpuDevice;
     int gpuId;
+    int numGpus;
 
-    uint64_t bandwidth;    // bytes per second
-    uint64_t latencyTicks; // link latency in ticks
+    uint64_t bandwidthBps;
+    Tick linkLatency;
     int numLanes;
     int maxLinks;
     int creditCount;
 
     uint64_t vramSizePerGpu;
 
-    /** Peer bridges indexed by GPU ID. */
+    /** Peer bridges from configuration (indexed by position, not GPU ID). */
     std::vector<XGMIBridge *> peers;
 
-    /** Per-destination credit counters. */
+    /** Per-destination credit counters (indexed by GPU ID). */
     std::vector<int> credits;
+
+    /** Per-destination send queues. */
+    std::vector<std::queue<XGMIPacket>> sendQueues;
+
+    /** Schedule delivery of a packet after link latency. */
+    void scheduleDelivery(XGMIPacket pkt);
+
+    /** Called by event: deliver packet to destination VRAM. */
+    void deliverPacket(XGMIPacket pkt);
+
+    /** Called by event: return credit to sender after completion. */
+    void returnCredit(int senderGpuId);
+
+    /** Delivery event wrapper. */
+    EventFunctionWrapper deliveryEvent;
 };
 
 } // namespace gem5

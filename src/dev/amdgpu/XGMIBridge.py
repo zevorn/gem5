@@ -8,21 +8,14 @@ from m5.SimObject import SimObject
 
 
 class XGMIBridge(SimObject):
-    """xGMI interconnect bridge between two MI300X GPU instances.
+    """xGMI interconnect bridge between MI300X GPU instances.
 
     Attached to each GPU's L2 cache (TCC) egress port.  Routes memory
     requests whose target address falls in a remote GPU's VRAM range
     through the modeled xGMI link instead of local memory.
 
-    Packet format:
-        src_gpu  : uint8  - source GPU ID
-        dst_gpu  : uint8  - destination GPU ID
-        addr     : uint64 - target VRAM address
-        size     : uint32 - payload size in bytes
-        payload  : bytes  - data (for writes)
-
-    The bridge is instantiated once per GPU and connects to all other
-    GPUs' bridges via the configured topology (mesh or ring).
+    The bridge is instantiated once per GPU and connects to peer bridges
+    via the 'peers' parameter (set during configuration).
     """
 
     type = "XGMIBridge"
@@ -31,6 +24,9 @@ class XGMIBridge(SimObject):
 
     gpu_device = Param.AMDGPUDevice("The GPU this bridge is attached to")
     gpu_id = Param.Int(0, "ID of the GPU this bridge belongs to")
+    num_gpus = Param.Int(1, "Total number of GPUs in the system")
+
+    peers = VectorParam.XGMIBridge([], "Peer bridges for xGMI topology")
 
     bandwidth = Param.MemoryBandwidth(
         "128GBps", "Per-link bandwidth (default: 128 GB/s)"
