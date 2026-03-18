@@ -409,11 +409,12 @@ SDMAEngine::decodeNext(SDMAQueue *q)
         if (q->rptrWbAddr()) {
             Addr wb_addr = q->rptrWbAddr();
             if (wb_addr < gpuDevice->getVRAMSize()) {
-                // VRAM address — write directly to device memory.
+                // VRAM address — translate to global before device memory.
+                Addr gaddr = gpuDevice->localToGlobalVRAM(wb_addr);
                 auto *buf = new uint64_t(q->globalRptr());
                 auto cb =
                     new EventFunctionWrapper([=] { delete buf; }, name());
-                gpuDevice->getMemMgr()->writeRequest(wb_addr, (uint8_t *)buf,
+                gpuDevice->getMemMgr()->writeRequest(gaddr, (uint8_t *)buf,
                                                      sizeof(Addr), 0, cb);
             } else {
                 auto cb = new DmaVirtCallback<uint64_t>(
@@ -1260,13 +1261,17 @@ SDMAEngine::atomic(SDMAQueue *q, uint32_t header, sdmaAtomic *pkt)
             " %d loopInt: %d\n", at_header.opcode, pkt->addr, pkt->srcData,
             pkt->cmpData, at_header.loop, pkt->loopInt);
 
-    // Read the data at pkt->addr
+    // Read the data at pkt->addr, translating raw VRAM to global
+    Addr atomicAddr = pkt->addr;
+    if (isRawVRAMAddress(atomicAddr)) {
+        atomicAddr = gpuDevice->localToGlobalVRAM(atomicAddr);
+    }
     uint64_t *dmaBuffer = new uint64_t;
     auto cb = new DmaVirtCallback<uint64_t>(
         [ = ] (const uint64_t &)
             { atomicData(q, header, pkt, dmaBuffer); });
-    dmaReadVirt(pkt->addr, sizeof(uint64_t), cb, (void *)dmaBuffer,
-            sdma_delay);
+    dmaReadVirt(atomicAddr, sizeof(uint64_t), cb, (void *)dmaBuffer,
+                sdma_delay);
 }
 
 void
@@ -1290,10 +1295,14 @@ SDMAEngine::atomicData(SDMAQueue *q, uint32_t header, sdmaAtomic *pkt,
         // Reuse the dmaBuffer allocated
         *dmaBuffer = dst_data + src_data;
 
+        Addr wbAddr = pkt->addr;
+        if (isRawVRAMAddress(wbAddr)) {
+            wbAddr = gpuDevice->localToGlobalVRAM(wbAddr);
+        }
         auto cb = new DmaVirtCallback<uint64_t>(
             [ = ] (const uint64_t &)
                 { atomicDone(q, header, pkt, dmaBuffer); });
-        dmaWriteVirt(pkt->addr, sizeof(uint64_t), cb, (void *)dmaBuffer);
+        dmaWriteVirt(wbAddr, sizeof(uint64_t), cb, (void *)dmaBuffer);
     } else {
         panic("Unsupported SDMA atomic opcode: %d\n", at_header.opcode);
     }
@@ -1684,7 +1693,7 @@ SDMAEngine::setGfxRptrLo(uint32_t data)
     gfxRptr |= data;
     // VRAM addresses should not go through GART page-walk transform.
     if (gfxRptr < gpuDevice->getVRAMSize()) {
-        gfx.rptrWbAddr(gfxRptr);
+        gfx.rptrWbAddr(gpuDevice->localToGlobalVRAM(gfxRptr));
     } else {
         gfx.rptrWbAddr(getGARTAddr(gfxRptr));
     }
@@ -1696,7 +1705,7 @@ SDMAEngine::setGfxRptrHi(uint32_t data)
     gfxRptr = insertBits(gfxRptr, 63, 32, 0);
     gfxRptr |= ((uint64_t)data) << 32;
     if (gfxRptr < gpuDevice->getVRAMSize()) {
-        gfx.rptrWbAddr(gfxRptr);
+        gfx.rptrWbAddr(gpuDevice->localToGlobalVRAM(gfxRptr));
     } else {
         gfx.rptrWbAddr(getGARTAddr(gfxRptr));
     }
@@ -1789,7 +1798,7 @@ SDMAEngine::setPageRptrLo(uint32_t data)
     pageRptr = insertBits(pageRptr, 31, 0, 0);
     pageRptr |= data;
     if (pageRptr < gpuDevice->getVRAMSize()) {
-        page.rptrWbAddr(pageRptr);
+        page.rptrWbAddr(gpuDevice->localToGlobalVRAM(pageRptr));
     } else {
         page.rptrWbAddr(getGARTAddr(pageRptr));
     }
@@ -1801,7 +1810,7 @@ SDMAEngine::setPageRptrHi(uint32_t data)
     pageRptr = insertBits(pageRptr, 63, 32, 0);
     pageRptr |= ((uint64_t)data) << 32;
     if (pageRptr < gpuDevice->getVRAMSize()) {
-        page.rptrWbAddr(pageRptr);
+        page.rptrWbAddr(gpuDevice->localToGlobalVRAM(pageRptr));
     } else {
         page.rptrWbAddr(getGARTAddr(pageRptr));
     }

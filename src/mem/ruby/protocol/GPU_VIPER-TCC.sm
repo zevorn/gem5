@@ -50,6 +50,13 @@ machine(MachineType:TCC, "TCC Cache")
   MessageBuffer * responseToNB, network="To", virtual_network="2", vnet_type="response";
   MessageBuffer * unblockToNB, network="To", virtual_network="4", vnet_type="unblock";
 
+  // xGMI: requests targeting remote GPU VRAM go through the same
+  // network but are routed to the remote GPU's directory controller
+  // via mapAddressToMachine.  In multi-process mode, the network
+  // layer forwards these through the XGMIBridge transport.
+  // No separate message buffer is needed: the directory address
+  // mapping handles routing automatically.
+
   MessageBuffer * triggerQueue;
 
 {
@@ -543,6 +550,10 @@ machine(MachineType:TCC, "TCC Cache")
   }
 
   action(rd_requestData, "r", desc="Miss in L2, pass on") {
+    // Routes to correct directory via mapAddressToMachine.
+    // For multi-GPU: remote GPU VRAM addresses are routed to the
+    // remote GPU's directory controller through the shared Ruby
+    // network (single-process) or xGMI transport (multi-process).
     peek(coreRequestNetwork_in, CPURequestMsg) {
       DPRINTF(RubySlicc, "in_msg: %s\n", in_msg);
       enqueue(requestToNB_out, CPURequestMsg, l2_request_latency) {
@@ -759,6 +770,7 @@ machine(MachineType:TCC, "TCC Cache")
   }
 
   action(wt_writeThrough, "wt", desc="write back data") {
+    // Routes to correct directory via mapAddressToMachine (xGMI-aware).
     peek(coreRequestNetwork_in, CPURequestMsg) {
       enqueue(requestToNB_out, CPURequestMsg, l2_request_latency) {
         out_msg.addr := address;
@@ -778,6 +790,7 @@ machine(MachineType:TCC, "TCC Cache")
   }
 
   action(wb_writeBack, "wb", desc="write back data") {
+    // Routes to correct directory via mapAddressToMachine (xGMI-aware).
     enqueue(requestToNB_out, CPURequestMsg, l2_request_latency) {
       out_msg.addr := address;
       out_msg.Requestor := machineID;

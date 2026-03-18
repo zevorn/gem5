@@ -141,15 +141,16 @@ void
 XGMIBridge::deliverPacket(XGMIPacket pkt)
 {
     DPRINTF(XGMIBridge,
-            "GPU %d: delivering packet from GPU %d, "
+            "GPU %d: delivering %s from GPU %d, "
             "addr=0x%lx size=%u\n",
-            gpuId, pkt.srcGpu, pkt.addr, pkt.size);
+            gpuId,
+            pkt.type == XGMIPacketType::ReadReq ? "ReadReq" : "WriteReq",
+            pkt.srcGpu, pkt.addr, pkt.size);
 
-    // Write payload to destination VRAM via device memory system
-    if (!pkt.payload.empty() && gpuDevice) {
-        Addr localAddr = gpuDevice->globalToLocalVRAM(pkt.addr);
-        auto *system = gpuDevice->CP()->shader()->gpuCmdProc.system();
+    auto *system = gpuDevice->CP()->shader()->gpuCmdProc.system();
 
+    if (pkt.type == XGMIPacketType::WriteReq && !pkt.payload.empty()) {
+        // Write payload to local VRAM
         RequestPtr req = std::make_shared<Request>(
             pkt.addr, pkt.size, 0, gpuDevice->vramRequestorId());
         PacketPtr writePkt = Packet::createWrite(req);
@@ -159,19 +160,56 @@ XGMIBridge::deliverPacket(XGMIPacket pkt)
         auto *devMem = system->getDeviceMemory(writePkt);
         if (devMem) {
             devMem->access(writePkt);
-            DPRINTF(XGMIBridge,
-                    "GPU %d: wrote %u bytes to VRAM "
-                    "addr=0x%lx (local=0x%lx)\n",
-                    gpuId, pkt.size, pkt.addr, localAddr);
-        } else {
-            warn("XGMIBridge GPU %d: no device memory for addr 0x%lx\n", gpuId,
-                 pkt.addr);
         }
         delete writePkt;
-    }
 
-    // Return credit to sender after delivery completes
-    returnCredit(pkt.srcGpu);
+        // Return credit after write completion
+        returnCredit(pkt.srcGpu);
+
+    } else if (pkt.type == XGMIPacketType::ReadReq) {
+        // Read data from local VRAM and send response back
+        RequestPtr req = std::make_shared<Request>(
+            pkt.addr, pkt.size, 0, gpuDevice->vramRequestorId());
+        PacketPtr readPkt = Packet::createRead(req);
+        uint8_t *dataPtr = new uint8_t[pkt.size];
+        readPkt->dataDynamic(dataPtr);
+
+        auto *devMem = system->getDeviceMemory(readPkt);
+        if (devMem) {
+            devMem->access(readPkt);
+
+            // Build read response with data
+            XGMIPacket resp;
+            resp.type = XGMIPacketType::ReadResp;
+            resp.srcGpu = gpuId;
+            resp.dstGpu = pkt.srcGpu;
+            resp.addr = pkt.addr;
+            resp.size = pkt.size;
+            resp.transactionId = pkt.transactionId;
+            resp.payload.resize(pkt.size);
+            std::memcpy(resp.payload.data(), dataPtr, pkt.size);
+
+            // Send response back to requester
+            if (pkt.srcGpu < static_cast<int>(peers.size()) &&
+                peers[pkt.srcGpu]) {
+                peers[pkt.srcGpu]->scheduleDelivery(std::move(resp));
+            }
+        }
+        delete readPkt;
+
+        // Return credit after read completes (data sent back)
+        returnCredit(pkt.srcGpu);
+
+    } else if (pkt.type == XGMIPacketType::ReadResp) {
+        // Read response arrived — data is in payload
+        DPRINTF(XGMIBridge,
+                "GPU %d: read response from GPU %d, "
+                "txn=%lu, %u bytes\n",
+                gpuId, pkt.srcGpu, pkt.transactionId, pkt.size);
+
+        // Credit returned by the responder side
+        returnCredit(pkt.srcGpu);
+    }
 }
 
 void

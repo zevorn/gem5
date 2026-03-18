@@ -23,12 +23,22 @@ class AMDGPUDevice;
 /**
  * xGMI packet header for inter-GPU communication.
  */
+enum class XGMIPacketType : uint8_t
+{
+    WriteReq = 0,   // Write data to remote VRAM
+    ReadReq = 1,    // Read data from remote VRAM
+    ReadResp = 2,   // Response with data from remote read
+    Completion = 3, // Write completion acknowledgment
+};
+
 struct XGMIPacket
 {
+    XGMIPacketType type = XGMIPacketType::WriteReq;
     uint8_t srcGpu;
     uint8_t dstGpu;
     uint64_t addr;
     uint32_t size;
+    uint64_t transactionId = 0;
     std::vector<uint8_t> payload;
 };
 
