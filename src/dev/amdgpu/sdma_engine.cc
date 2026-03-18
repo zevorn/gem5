@@ -145,11 +145,12 @@ SDMAEngine::getDeviceAddress(Addr raw_addr)
 {
     if (cur_vmid == 0) {
         if (gpuDevice->getVM().inMMHUB(raw_addr)) {
-            return raw_addr - gpuDevice->getVM().getMMHUBBase();
+            Addr local = raw_addr - gpuDevice->getVM().getMMHUBBase();
+            return gpuDevice->localToGlobalVRAM(local);
         }
 
         if (isRawVRAMAddress(raw_addr)) {
-            return raw_addr;
+            return gpuDevice->localToGlobalVRAM(raw_addr);
         }
     }
 
@@ -172,7 +173,8 @@ SDMAEngine::getDeviceAddress(Addr raw_addr)
     // get the device address. Otherwise, for host, device address is 0.
     Addr device_addr = 0;
     if (gpuDevice->getVM().inMMHUB(tmp_addr) && cur_vmid != 0) {
-        device_addr = tmp_addr - gpuDevice->getVM().getMMHUBBase();
+        Addr local = tmp_addr - gpuDevice->getVM().getMMHUBBase();
+        device_addr = gpuDevice->localToGlobalVRAM(local);
     }
 
     return device_addr;

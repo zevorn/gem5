@@ -42,7 +42,7 @@ XGMIBridge::init()
     credits.resize(numGpus, creditCount);
     sendQueues.resize(numGpus);
 
-    for (auto *peer : p.peers) {
+    for (auto *peer : params().peers) {
         int peerId = peer->gpuId;
         if (peerId >= 0 && peerId < numGpus && peerId != gpuId) {
             if (static_cast<int>(peers.size()) <= peerId) {
@@ -148,7 +148,7 @@ XGMIBridge::deliverPacket(XGMIPacket pkt)
     // Write payload to destination VRAM via device memory system
     if (!pkt.payload.empty() && gpuDevice) {
         Addr localAddr = gpuDevice->globalToLocalVRAM(pkt.addr);
-        auto *system = gpuDevice->cp->shader()->gpuCmdProc.system();
+        auto *system = gpuDevice->CP()->shader()->gpuCmdProc.system();
 
         RequestPtr req = std::make_shared<Request>(
             pkt.addr, pkt.size, 0, gpuDevice->vramRequestorId());

@@ -459,7 +459,7 @@ PM4PacketProcessor::writeData(PM4Queue *q, PM4WriteData *pkt, PM4Header header)
 
         if (isVRAMAddress(pkt->destAddr)) {
             // Direct VRAM write — bypass GART, use device memory.
-            Addr addr = pkt->destAddr;
+            Addr addr = gpuDevice->localToGlobalVRAM(pkt->destAddr);
             DPRINTF(PM4PacketProcessor, "Writing %d bytes to VRAM %p\n", size,
                     addr);
             auto cb = new EventFunctionWrapper(
@@ -638,7 +638,8 @@ PM4PacketProcessor::releaseMem(PM4Queue *q, PM4ReleaseMem *pkt)
     q->incRptr(sizeof(PM4ReleaseMem));
 
     bool vram = isVRAMAddress(pkt->addr);
-    Addr addr = vram ? pkt->addr : getGARTAddr(pkt->addr);
+    Addr addr = vram ? gpuDevice->localToGlobalVRAM(pkt->addr)
+                     : getGARTAddr(pkt->addr);
     DPRINTF(PM4PacketProcessor,
             "PM4 release_mem event %d eventIdx %d intSel "
             "%d destSel %d dataSel %d, address %p data %p, intCtx %p "
@@ -1003,6 +1004,7 @@ PM4PacketProcessor::waitRegMemPoll(PM4Queue *q, PM4WaitRegMem *pkt)
         const Addr addr = waitRegMemMemAddr(pkt);
 
         if (isVRAMAddress(addr)) {
+            Addr gaddr = gpuDevice->localToGlobalVRAM(addr);
             auto *value = new uint32_t(0);
             auto cb = new EventFunctionWrapper(
                 [=] {
@@ -1012,7 +1014,7 @@ PM4PacketProcessor::waitRegMemPoll(PM4Queue *q, PM4WaitRegMem *pkt)
                 },
                 name());
             gpuDevice->getMemMgr()->readRequest(
-                addr, reinterpret_cast<uint8_t *>(value), sizeof(*value), 0,
+                gaddr, reinterpret_cast<uint8_t *>(value), sizeof(*value), 0,
                 cb);
         } else {
             Addr gart_addr = getGARTAddr(addr);
@@ -1085,11 +1087,12 @@ PM4PacketProcessor::queryStatus(PM4Queue *q, PM4QueryStatus *pkt)
     if (pkt->interruptSel == 0 && pkt->command == 2) {
         // Write data value to fence address
         if (isVRAMAddress(pkt->addr)) {
-            DPRINTF(PM4PacketProcessor, "Using VRAM addr %lx\n", pkt->addr);
+            Addr gaddr = gpuDevice->localToGlobalVRAM(pkt->addr);
+            DPRINTF(PM4PacketProcessor, "Using VRAM addr %lx\n", gaddr);
             auto cb = new EventFunctionWrapper(
                 [=] { queryStatusDone(q, pkt); }, name());
-            gpuDevice->getMemMgr()->writeRequest(
-                pkt->addr, (uint8_t *)&pkt->data, sizeof(uint64_t), 0, cb);
+            gpuDevice->getMemMgr()->writeRequest(gaddr, (uint8_t *)&pkt->data,
+                                                 sizeof(uint64_t), 0, cb);
         } else {
             Addr addr = getGARTAddr(pkt->addr);
             DPRINTF(PM4PacketProcessor, "Using GART addr %lx\n", addr);
