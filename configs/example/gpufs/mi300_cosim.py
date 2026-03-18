@@ -108,6 +108,25 @@ def addCosimOptions(parser):
         default=1,
         help="Number of MI300X GPU instances (default: 1)",
     )
+    parser.add_argument(
+        "--xgmi-topology",
+        type=str,
+        choices=["mesh", "ring"],
+        default=None,
+        help="xGMI interconnect topology (requires --num-gpus >= 2)",
+    )
+    parser.add_argument(
+        "--xgmi-bandwidth",
+        type=str,
+        default="128GBps",
+        help="xGMI per-link bandwidth (default: 128GBps)",
+    )
+    parser.add_argument(
+        "--xgmi-latency",
+        type=str,
+        default="100ns",
+        help="xGMI per-hop latency (default: 100ns)",
+    )
 
 
 def _gpu_socket_path(base_path, gpu_id, num_gpus):
@@ -379,16 +398,16 @@ def buildCosimSystem(args):
     )
 
     system.ruby = Disjoint_VIPER()
-    system.ruby.create(args, system, system.iobus, system._dma_ports)
+    system.ruby.create(
+        args,
+        system,
+        system.iobus,
+        system._dma_ports,
+        gpu_devices=gpu_devices,
+    )
     system.ruby.clk_domain = SrcClockDomain(
         clock=args.ruby_clock, voltage_domain=system.voltage_domain
     )
-
-    # Assign GPU memories to all GPU devices (VIPER only assigns to GPU 0)
-    if num_gpus > 1:
-        gpu0_mems = system.pc.south_bridge.gpu.memories
-        for gpu_id in range(1, num_gpus):
-            gpu_devices[gpu_id].memories = gpu0_mems
 
     # ----------------------------------------------------------------
     # Wire CPU ports
@@ -492,6 +511,44 @@ def buildCosimSystem(args):
         system.cosim = cosim_bridges[0]
     else:
         system.cosim_bridges = cosim_bridges
+
+    # ----------------------------------------------------------------
+    # xGMI interconnect bridges (Milestone 2)
+    # ----------------------------------------------------------------
+    xgmi_topo = getattr(args, "xgmi_topology", None)
+    if xgmi_topo is not None:
+        if num_gpus < 2:
+            m5.util.panic("--xgmi-topology requires --num-gpus >= 2")
+
+        xgmi_bw = getattr(args, "xgmi_bandwidth", "128GBps")
+        xgmi_lat = getattr(args, "xgmi_latency", "100ns")
+
+        xgmi_bridges = []
+        for gpu_id in range(num_gpus):
+            xb = XGMIBridge(
+                gpu_device=gpu_devices[gpu_id],
+                gpu_id=gpu_id,
+                bandwidth=xgmi_bw,
+                latency=xgmi_lat,
+                vram_size_per_gpu=args.dgpu_mem_size,
+            )
+            xgmi_bridges.append(xb)
+
+        # Connect peers based on topology
+        if xgmi_topo == "mesh":
+            for i in range(num_gpus):
+                for j in range(num_gpus):
+                    if i != j:
+                        xgmi_bridges[i].addPeer(xgmi_bridges[j])
+        elif xgmi_topo == "ring":
+            for i in range(num_gpus):
+                nxt = (i + 1) % num_gpus
+                prv = (i - 1) % num_gpus
+                xgmi_bridges[i].addPeer(xgmi_bridges[nxt])
+                if prv != nxt:
+                    xgmi_bridges[i].addPeer(xgmi_bridges[prv])
+
+        system.xgmi_bridges = xgmi_bridges
 
     # Restore per-GPU CU count
     args.num_compute_units = per_gpu_cus

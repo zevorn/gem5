@@ -49,7 +49,9 @@ class Disjoint_VIPER(RubySystem):
 
         super().__init__()
 
-    def create(self, options, system, piobus, dma_devices):
+    def create(self, options, system, piobus, dma_devices, gpu_devices=None):
+        num_gpus = len(gpu_devices) if gpu_devices else 1
+
         # Disjoint network topology
         if "garnet" in options.network:
             self.network_cpu = DisjointGarnet(self)
@@ -83,10 +85,33 @@ class Disjoint_VIPER(RubySystem):
         # Construct CPU memories
         Ruby.setup_memory_controllers(system, self, cpu_dir_nodes, options)
 
-        # Construct GPU memories
-        (gpu_dir_nodes, gpu_mem_ctrls) = construct_gpudirs(
-            options, system, self, self.network_gpu
-        )
+        # Construct GPU memories — per-GPU isolation for multi-GPU
+        from m5.util import convert
+
+        dgpu_mem_bytes = convert.toMemorySize(options.dgpu_mem_size)
+        all_gpu_dir_nodes = []
+        all_gpu_mem_ctrls = []
+        per_gpu_mem_ctrls = {}
+
+        for gpu_id in range(num_gpus):
+            addr_offset = gpu_id * dgpu_mem_bytes
+            dir_idx_offset = gpu_id * options.dgpu_num_dirs
+            (dir_nodes, mem_ctrls) = construct_gpudirs(
+                options,
+                system,
+                self,
+                self.network_gpu,
+                addr_offset=addr_offset,
+                dir_idx_offset=dir_idx_offset,
+            )
+            all_gpu_dir_nodes.extend(dir_nodes)
+            all_gpu_mem_ctrls.extend(mem_ctrls)
+            per_gpu_mem_ctrls[gpu_id] = mem_ctrls
+
+        gpu_dir_nodes = all_gpu_dir_nodes
+
+        # Reassign all GPU memory controllers to system
+        system.gpu_mem_ctrls = all_gpu_mem_ctrls
 
         # Configure the directories based on which network they are in
         for cpu_dir_node in cpu_dir_nodes:
@@ -106,19 +131,26 @@ class Disjoint_VIPER(RubySystem):
             cpu_abstract_mems.append(mem_ctrl.dram)
         system.memories = cpu_abstract_mems
 
-        gpu_abstract_mems = []
+        # Assign per-GPU memories to each GPU device
+        def _extract_abstract_mems(mem_ctrls_list):
+            mems = []
+            for mem_ctrl in mem_ctrls_list:
+                if hasattr(mem_ctrl, "dram"):
+                    mems.append(mem_ctrl.dram)
+                else:
+                    mems.append(mem_ctrl)
+                if hasattr(mem_ctrl, "dram_2"):
+                    mems.append(mem_ctrl.dram_2)
+            return mems
 
-        for mem_ctrl in gpu_mem_ctrls:
-            # memctrl
-            if hasattr(mem_ctrl, "dram"):
-                gpu_abstract_mems.append(mem_ctrl.dram)
-            else:
-                gpu_abstract_mems.append(mem_ctrl)
-            # hbmctrl
-            if hasattr(mem_ctrl, "dram_2"):
-                gpu_abstract_mems.append(mem_ctrl.dram_2)
-
-        system.pc.south_bridge.gpu.memories = gpu_abstract_mems
+        if gpu_devices:
+            for gpu_id, gpu in enumerate(gpu_devices):
+                gpu.memories = _extract_abstract_mems(
+                    per_gpu_mem_ctrls[gpu_id]
+                )
+        else:
+            all_gpu_mems = _extract_abstract_mems(all_gpu_mem_ctrls)
+            system.pc.south_bridge.gpu.memories = all_gpu_mems
 
         # Setup DMA controllers
         gpu_dma_types = ["VegaPagetableWalker", "AMDGPUMemoryManager"]

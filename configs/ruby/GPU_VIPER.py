@@ -607,7 +607,9 @@ def construct_dirs(options, system, ruby_system, network):
     return dir_cntrl_nodes
 
 
-def construct_gpudirs(options, system, ruby_system, network):
+def construct_gpudirs(
+    options, system, ruby_system, network, addr_offset=0, dir_idx_offset=0
+):
     dir_cntrl_nodes = []
     mem_ctrls = []
 
@@ -620,7 +622,7 @@ def construct_gpudirs(options, system, ruby_system, network):
     block_size_bits = int(math.log(options.cacheline_size, 2))
     numa_bit = block_size_bits + dir_bits - 1
 
-    gpu_mem_range = AddrRange(0, size=options.dgpu_mem_size)
+    gpu_mem_range = AddrRange(addr_offset, size=options.dgpu_mem_size)
     for i in range(options.dgpu_num_dirs):
         addr_range = m5.objects.AddrRange(
             gpu_mem_range.start,
@@ -717,7 +719,8 @@ def construct_gpudirs(options, system, ruby_system, network):
         else:
             dir_cntrl.addr_ranges = dram_intf.range
         # Append
-        exec("ruby_system.gpu_dir_cntrl%d = dir_cntrl" % i)
+        global_idx = dir_idx_offset + i
+        exec("ruby_system.gpu_dir_cntrl%d = dir_cntrl" % global_idx)
         dir_cntrl_nodes.append(dir_cntrl)
         mem_ctrls.append(mem_ctrl)
 

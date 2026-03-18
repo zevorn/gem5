@@ -184,7 +184,7 @@ def createGPU(system, args, gpu_id=0):
 
 
 def connectGPU(system, args, gpu_id=0):
-    gpu = AMDGPUDevice(pci_func=0, pci_dev=8 + gpu_id)
+    gpu = AMDGPUDevice(pci_func=0, pci_dev=8 + gpu_id, gpu_id=gpu_id)
 
     # GPU 0 goes to south_bridge.gpu for backward compatibility
     if gpu_id == 0:
