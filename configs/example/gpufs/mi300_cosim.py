@@ -118,8 +118,8 @@ def addCosimOptions(parser):
     parser.add_argument(
         "--xgmi-bandwidth",
         type=str,
-        default="128GBps",
-        help="xGMI per-link bandwidth (default: 128GBps)",
+        default="128GB/s",
+        help="xGMI per-link bandwidth (default: 128GB/s)",
     )
     parser.add_argument(
         "--xgmi-latency",
@@ -520,7 +520,7 @@ def buildCosimSystem(args):
         if num_gpus < 2:
             m5.util.panic("--xgmi-topology requires --num-gpus >= 2")
 
-        xgmi_bw = getattr(args, "xgmi_bandwidth", "128GBps")
+        xgmi_bw = getattr(args, "xgmi_bandwidth", "128GB/s")
         xgmi_lat = getattr(args, "xgmi_latency", "100ns")
 
         # Create bridge objects (peers assigned after all are created)
@@ -593,8 +593,8 @@ if __name__ == "__m5_main__":
     xgmi_topo = getattr(args, "xgmi_topology", None)
     if xgmi_topo is not None and num_gpus < 2:
         m5.util.panic("--xgmi-topology requires --num-gpus >= 2")
-    xgmi_bw = getattr(args, "xgmi_bandwidth", "128GBps")
-    if xgmi_bw == "0GBps" or xgmi_bw == "0":
+    xgmi_bw = getattr(args, "xgmi_bandwidth", "128GB/s")
+    if convert.toMemoryBandwidth(xgmi_bw) <= 0:
         m5.util.panic("--xgmi-bandwidth must be > 0")
     xgmi_lat = getattr(args, "xgmi_latency", "100ns")
     if xgmi_lat == "0ns" or xgmi_lat == "0":

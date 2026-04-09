@@ -29,7 +29,7 @@ class XGMIBridge(SimObject):
     peers = VectorParam.XGMIBridge([], "Peer bridges for xGMI topology")
 
     bandwidth = Param.MemoryBandwidth(
-        "128GBps", "Per-link bandwidth (default: 128 GB/s)"
+        "128GB/s", "Per-link bandwidth (default: 128 GB/s)"
     )
     latency = Param.Latency("100ns", "Per-hop link latency")
     num_lanes = Param.Int(16, "Number of xGMI lanes per link")
