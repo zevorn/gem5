@@ -60,47 +60,30 @@ namespace gem5
 class HSAQueueEntry
 {
   public:
-    struct PhysRange
-    {
-        Addr addr;
-        Addr size;
-    };
-
-    HSAQueueEntry(std::string kernel_name, uint32_t queue_id, int dispatch_id,
-                  void *disp_pkt, AMDKernelCode *akc, Addr host_pkt_addr,
-                  Addr code_addr, GfxVersion gfx_version)
-        : _gfxVersion(gfx_version),
-          kernName(kernel_name),
-          _wgSize{
-              {(int)((_hsa_dispatch_packet_t *)disp_pkt)->workgroup_size_x,
-               (int)((_hsa_dispatch_packet_t *)disp_pkt)->workgroup_size_y,
-               (int)((_hsa_dispatch_packet_t *)disp_pkt)->workgroup_size_z}},
-          _gridSize{{(int)((_hsa_dispatch_packet_t *)disp_pkt)->grid_size_x,
-                     (int)((_hsa_dispatch_packet_t *)disp_pkt)->grid_size_y,
-                     (int)((_hsa_dispatch_packet_t *)disp_pkt)->grid_size_z}},
-          _queueId(queue_id),
-          _dispatchId(dispatch_id),
-          dispPkt(disp_pkt),
+    HSAQueueEntry(std::string kernel_name, uint32_t queue_id,
+                  int dispatch_id, void *disp_pkt, AMDKernelCode *akc,
+                  Addr host_pkt_addr, Addr code_addr, GfxVersion gfx_version)
+        : _gfxVersion(gfx_version), kernName(kernel_name),
+          _wgSize{{(int)((_hsa_dispatch_packet_t*)disp_pkt)->workgroup_size_x,
+                  (int)((_hsa_dispatch_packet_t*)disp_pkt)->workgroup_size_y,
+                  (int)((_hsa_dispatch_packet_t*)disp_pkt)->workgroup_size_z}},
+          _gridSize{{(int)((_hsa_dispatch_packet_t*)disp_pkt)->grid_size_x,
+                    (int)((_hsa_dispatch_packet_t*)disp_pkt)->grid_size_y,
+                    (int)((_hsa_dispatch_packet_t*)disp_pkt)->grid_size_z}},
+          _queueId(queue_id), _dispatchId(dispatch_id), dispPkt(disp_pkt),
           _hostDispPktAddr(host_pkt_addr),
-          _completionSignal(
-              ((_hsa_dispatch_packet_t *)disp_pkt)->completion_signal),
+          _completionSignal(((_hsa_dispatch_packet_t*)disp_pkt)
+                            ->completion_signal),
           codeAddress(code_addr),
-          kernargAddress(
-              ((_hsa_dispatch_packet_t *)disp_pkt)->kernarg_address),
-          _kernargSize(akc->kernarg_size),
-          _outstandingInvs(-1),
-          _outstandingWbs(0),
-          _ldsSize(
-              (int)((_hsa_dispatch_packet_t *)disp_pkt)->group_segment_size),
-          _privMemPerItem(
-              (int)((_hsa_dispatch_packet_t *)disp_pkt)->private_segment_size),
-          _contextId(0),
-          _wgId{{0, 0, 0}},
-          _numWgTotal(1),
-          numWgArrivedAtBarrier(0),
-          _numWgCompleted(0),
-          _globalWgId(0),
-          dispatchComplete(false)
+          kernargAddress(((_hsa_dispatch_packet_t*)disp_pkt)->kernarg_address),
+          _outstandingInvs(-1), _outstandingWbs(0),
+          _ldsSize((int)((_hsa_dispatch_packet_t*)disp_pkt)->
+                   group_segment_size),
+          _privMemPerItem((int)((_hsa_dispatch_packet_t*)disp_pkt)->
+                         private_segment_size),
+          _contextId(0), _wgId{{ 0, 0, 0 }},
+          _numWgTotal(1), numWgArrivedAtBarrier(0), _numWgCompleted(0),
+          _globalWgId(0), dispatchComplete(false)
 
     {
         // Use the resource descriptors to determine number of GPRs. This will
@@ -228,24 +211,6 @@ class HSAQueueEntry
     kernargAddr() const
     {
         return kernargAddress;
-    }
-
-    uint32_t
-    kernargSize() const
-    {
-        return _kernargSize;
-    }
-
-    void
-    addKernargPhysRange(Addr addr, Addr size)
-    {
-        kernargPhysRanges.push_back({addr, size});
-    }
-
-    const std::vector<PhysRange> &
-    kernargPhysAddrs() const
-    {
-        return kernargPhysRanges;
     }
 
     int
@@ -534,9 +499,6 @@ class HSAQueueEntry
     Addr codeAddress;
     // base address of the kernel args
     Addr kernargAddress;
-    // physical ranges backing kernel args, translated at dispatch.
-    std::vector<PhysRange> kernargPhysRanges;
-    uint32_t _kernargSize;
     /**
      * Number of outstanding invs for the kernel.
      * values:

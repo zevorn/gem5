@@ -325,6 +325,9 @@ VIPERCoalescer::invTCCCallback(Addr addr)
         MemResponsePort *port = ss->port;
         assert(port != nullptr);
 
+        // Now convert to MemSyncResp
+        pkt->makeResponse();
+
         pkt->senderState = ss->predecessor;
         delete ss;
         port->hitCallback(pkt);

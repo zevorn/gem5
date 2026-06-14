@@ -31,8 +31,6 @@
 
 #include "gpu-compute/shader.hh"
 
-#include "base/intmath.hh"
-
 #include <limits>
 
 #include "arch/amdgpu/common/gpu_translation_state.hh"
@@ -213,22 +211,6 @@ Shader::prepareInvalidate(HSAQueueEntry *task) {
     // counter value is 0 now, indicating the inv is about to start
     _dispatcher.updateInvCounter(kernId, +1);
 
-    // Iterate all physical kernarg ranges recorded for the dispatch, and
-    // invalidate each covered GL2 cache line before any workgroup starts.
-    for (const auto &range : task->kernargPhysAddrs()) {
-        ComputeUnit *cu = cuList[0];
-        const Addr line_size = cu->cacheLineSize();
-        const Addr line_base = roundDown(range.addr, line_size);
-        const Addr line_end = roundUp(range.addr + range.size, line_size);
-
-        for (Addr line = line_base; line < line_end; line += line_size) {
-            auto req = std::make_shared<Request>(line, line_size, 0,
-                                                 cu->requestorId(), 0, -1);
-            _dispatcher.updateInvCounter(kernId, +1);
-            cu->doL2Invalidate(req, kernId);
-        }
-    }
-
     // iterate all cus managed by the shader, to perform invalidate.
     for (int i_cu = 0; i_cu < n_cu; ++i_cu) {
         // create a request to hold INV info; the request's fields will
@@ -249,10 +231,6 @@ Shader::prepareInvalidate(HSAQueueEntry *task) {
                                                  0, -1);
 
         if ((i_cu % n_cu_per_sqc) == 0) {
-            // doSQCInvalidate sends one SQC request and one scalar cache
-            // request. Count both responses before the kernel can launch.
-            _dispatcher.updateInvCounter(kernId, +1);
-            _dispatcher.updateInvCounter(kernId, +1);
             cuList[i_cu]->doSQCInvalidate(sqc_req, task->dispatchId());
         }
 

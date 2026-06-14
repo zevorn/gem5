@@ -31,7 +31,6 @@
 
 #include "gpu-compute/gpu_command_processor.hh"
 
-#include <algorithm>
 #include <cassert>
 
 #include "arch/amdgpu/vega/pagetable_walker.hh"
@@ -355,35 +354,6 @@ GPUCommandProcessor::dispatchKernelObject(AMDKernelCode *akc, void *raw_pkt,
     HSAQueueEntry *task = new HSAQueueEntry(kernel_name, queue_id,
         dynamic_task_id, raw_pkt, akc, host_pkt_addr, machine_code_addr,
         gfxVersion);
-
-    if (FullSystem && task->kernargAddr() != 0 && task->kernargSize() > 0) {
-        Addr va = task->kernargAddr();
-        Addr remaining = task->kernargSize();
-
-        while (remaining > 0) {
-            Addr pa = va;
-            bool system = true;
-            unsigned log_bytes = 0;
-            // Cosim currently dispatches user kernels through VMID 1, matching
-            // the existing full-system GPUVM translation path in translate().
-            Fault fault = walker->startFunctional(
-                gpuDevice->getVM().getPageTableBase(1), pa, log_bytes,
-                BaseMMU::Mode::Read, system);
-
-            fatal_if(fault != NoFault,
-                     "Failed to translate kernarg range %#x size %#x\n", va,
-                     remaining);
-
-            const Addr page_size = Addr(1) << log_bytes;
-            const Addr page_offset = va & (page_size - 1);
-            const Addr chunk_size =
-                std::min(remaining, page_size - page_offset);
-
-            task->addKernargPhysRange(pa, chunk_size);
-            va += chunk_size;
-            remaining -= chunk_size;
-        }
-    }
 
     // The driver expects the start time to be in ns
     Tick start_ts = curTick() / sim_clock::as_int::ns;

@@ -421,7 +421,6 @@ class ComputeUnit : public ClockedObject
                         bool fetchContext=false);
 
     void doInvalidate(RequestPtr req, int kernId);
-    void doL2Invalidate(RequestPtr req, int kernId);
     void doFlush(GPUDynInstPtr gpuDynInst);
     void doSQCInvalidate(RequestPtr req, int kernId);
 
