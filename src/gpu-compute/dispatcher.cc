@@ -151,9 +151,10 @@ GPUDispatcher::exec()
     }
 
     /**
-     * dispatch work cannot start until the kernel's invalidate is
-     * completely finished; hence, kernel will always initiates
-     * invalidate first and keeps waiting until inv done
+     * Dispatch always starts the launch acquire/invalidate for the kernel at
+     * the head of the queue before dispatching any of its workgroups. Once
+     * that invalidate has started, keep that kernel selected until the
+     * invalidate finishes and the dispatcher is scheduled again.
      */
     while (execIds.size() > fail_count) {
         int exec_id = execIds.front();
@@ -170,19 +171,21 @@ GPUDispatcher::exec()
         }
 
         /**
-         * invalidate is still ongoing, put the kernel on the queue to
-         * retry later
+         * The selected kernel's launch invalidate is in flight. Do not rotate
+         * the queue or let a later kernel start its own launch invalidate.
          */
-        if (!task->isInvDone()){
-            execIds.push(exec_id);
+        if (!task->isInvDone()) {
             ++fail_count;
 
             DPRINTF(GPUDisp, "kernel %d failed to launch, due to [%d] pending"
                 " invalidate requests\n", exec_id, task->outstandingInvs());
 
-            // try the next kernel_id
-            execIds.pop();
-            continue;
+            // Ruby Sequencer tracks one cache invalidate packet at a time, so
+            // keep the selected kernel in launch-invalidate progress instead
+            // of rotating to a later kernel. TODO: Split launch-invalidate
+            // progress from resource-fit checks so the dispatcher can safely
+            // rotate only after it knows no new launch invalidate will start.
+            break;
         }
 
         // kernel invalidate is done, start workgroup dispatch

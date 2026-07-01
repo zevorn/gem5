@@ -1252,7 +1252,9 @@ ComputeUnit::SQCPort::recvTimingResp(PacketPtr pkt)
         // the compute unit
         if (sender_state->isKernDispatch) {
             int dispType = sender_state->dispatchType;
-            computeUnit->shader->gpuCmdProc.completeTimingRead(dispType);
+            delete pkt->senderState;
+            pkt->senderState = nullptr;
+            computeUnit->shader->gpuCmdProc.completeTimingRead(pkt, dispType);
         } else {
             computeUnit->handleSQCReturn(pkt);
         }

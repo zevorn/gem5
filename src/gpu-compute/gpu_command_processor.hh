@@ -45,6 +45,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <unordered_map>
 
 #include "arch/amdgpu/vega/gpu_registers.hh"
 #include "base/logging.hh"
@@ -94,11 +95,18 @@ class GPUCommandProcessor : public DmaVirtDevice
         uint32_t queue_id = 0;
         Addr host_pkt_addr = 0;
         uint16_t vmid = 0;
-        PacketPtr readPkt = nullptr;
         HSAQueueEntry *task = nullptr;
     };
 
-    std::list<struct KernelDispatchData> kernelDispatchList;
+    struct KernelDispatchReadContext
+    {
+        KernelDispatchData dispatchData;
+        int pendingReads = 0;
+        int dispatchType = 0;
+    };
+
+    std::unordered_map<PacketPtr, KernelDispatchReadContext *>
+        kernelDispatchReads;
 
     enum AgentCmd
     {
@@ -108,7 +116,7 @@ class GPUCommandProcessor : public DmaVirtDevice
 
     void performTimingRead(PacketPtr pkt, int dispType);
 
-    void completeTimingRead(int dispType);
+    void completeTimingRead(PacketPtr pkt, int dispType);
 
     void submitAgentDispatchPkt(void *raw_pkt, uint32_t queue_id,
                                 Addr host_pkt_addr, Event *done_event);

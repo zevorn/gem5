@@ -141,7 +141,7 @@ GPUCommandProcessor::performTimingRead(PacketPtr pkt, int dispType)
     ComputeUnit::SQCPort::SenderState *sender_state =
         safe_cast<ComputeUnit::SQCPort::SenderState*>(pkt->senderState);
     sender_state->dispatchType = dispType;
-    ComputeUnit::SQCPort sqc_port = cu->sqcPort;
+    ComputeUnit::SQCPort &sqc_port = cu->sqcPort;
 
     if (!sqc_port.sendTimingReq(pkt)) {
         sqc_port.retries.push_back(
@@ -151,26 +151,38 @@ GPUCommandProcessor::performTimingRead(PacketPtr pkt, int dispType)
 }
 
 void
-GPUCommandProcessor::completeTimingRead(int dispType)
+GPUCommandProcessor::completeTimingRead(PacketPtr pkt, int dispType)
 {
-    struct KernelDispatchData dispatchData = kernelDispatchList.front();
-    kernelDispatchList.pop_front();
-    delete dispatchData.readPkt;
+    auto it = kernelDispatchReads.find(pkt);
+    panic_if(it == kernelDispatchReads.end(),
+             "Completed unknown kernel dispatch timing read pkt=%p", pkt);
 
-    // Only one of the following can happen at any time from one CP. Figure
-    // out what performed the timing read and call to appropriate function.
-    if (kernelDispatchList.size() == 0) {
-        switch (dispType) {
-          case ComputeUnit::SQCPort::SenderState::DISPATCH_KERNEL_OBJECT:
-              dispatchKernelObject(dispatchData.akc, dispatchData.raw_pkt,
-                                   dispatchData.queue_id,
-                                   dispatchData.host_pkt_addr,
-                                   dispatchData.vmid);
-              break;
-          case ComputeUnit::SQCPort::SenderState::DISPATCH_PRELOAD_ARG:
+    KernelDispatchReadContext *ctx = it->second;
+    kernelDispatchReads.erase(it);
+    delete pkt;
+
+    panic_if(ctx->dispatchType != dispType,
+             "Mismatched kernel dispatch timing read type %d != %d",
+             ctx->dispatchType, dispType);
+
+    if (--ctx->pendingReads != 0) {
+        return;
+    }
+
+    struct KernelDispatchData dispatchData = ctx->dispatchData;
+    delete ctx;
+
+    switch (dispType) {
+        case ComputeUnit::SQCPort::SenderState::DISPATCH_KERNEL_OBJECT:
+            dispatchKernelObject(
+                dispatchData.akc, dispatchData.raw_pkt, dispatchData.queue_id,
+                dispatchData.host_pkt_addr, dispatchData.vmid);
+            break;
+        case ComputeUnit::SQCPort::SenderState::DISPATCH_PRELOAD_ARG:
             initPreload(dispatchData.akc, dispatchData.task);
             break;
-        }
+        default:
+            panic("Unknown kernel dispatch timing read type %d", dispType);
     }
 }
 
@@ -289,6 +301,15 @@ GPUCommandProcessor::submitDispatchPkt(void *raw_pkt, uint32_t queue_id,
             DPRINTF(GPUCommandProc,
                     "kernel_object in device, using device mem\n");
 
+            auto *dispatchReadCtx = new KernelDispatchReadContext;
+            dispatchReadCtx->dispatchData.akc = akc;
+            dispatchReadCtx->dispatchData.raw_pkt = raw_pkt;
+            dispatchReadCtx->dispatchData.queue_id = queue_id;
+            dispatchReadCtx->dispatchData.host_pkt_addr = host_pkt_addr;
+            dispatchReadCtx->dispatchData.vmid = vmid;
+            dispatchReadCtx->dispatchType =
+                ComputeUnit::SQCPort::SenderState::DISPATCH_KERNEL_OBJECT;
+
             // Read from GPU memory manager one cache line at a time to prevent
             // rare cases where the AKC spans two memory pages.
             ChunkGenerator gen(disp_pkt->kernel_object, sizeof(AMDKernelCode),
@@ -309,14 +330,8 @@ GPUCommandProcessor::submitDispatchPkt(void *raw_pkt, uint32_t queue_id,
                 // If the request spans two device memories, the device memory
                 // returned will be null.
                 assert(system()->getDeviceMemory(readPkt) != nullptr);
-                struct KernelDispatchData dispatchData;
-                dispatchData.akc = akc;
-                dispatchData.raw_pkt = raw_pkt;
-                dispatchData.queue_id = queue_id;
-                dispatchData.host_pkt_addr = host_pkt_addr;
-                dispatchData.vmid = vmid;
-                dispatchData.readPkt = readPkt;
-                kernelDispatchList.push_back(dispatchData);
+                ++dispatchReadCtx->pendingReads;
+                kernelDispatchReads[readPkt] = dispatchReadCtx;
                 performTimingRead(readPkt,
                     ComputeUnit::SQCPort::SenderState::DISPATCH_KERNEL_OBJECT);
             }
@@ -864,6 +879,11 @@ GPUCommandProcessor::readPreload(AMDKernelCode *akc, HSAQueueEntry *task)
     // the dword offset specified by kernarg_preload_spec_offset.
     Addr preload_addr = (Addr)disp_pkt->kernarg_address
         + akc->kernarg_preload_spec_offset * 4;
+    const unsigned preload_size =
+        sizeof(uint32_t) * akc->kernarg_preload_spec_length;
+    panic_if(preload_size > KernargPreloadPktSize,
+             "Kernarg preload size %u exceeds local buffer size %u",
+             preload_size, KernargPreloadPktSize);
 
     DPRINTF(GPUCommandProc, "Kernarg preload starts at addr: %#x\n",
             preload_addr);
@@ -903,16 +923,19 @@ GPUCommandProcessor::readPreload(AMDKernelCode *akc, HSAQueueEntry *task)
                 initPreload(akc, task);
             });
 
-        dmaReadVirtForVMID(preload_addr,
-                           sizeof(uint32_t) * akc->kernarg_preload_spec_length,
-                           cb, task->preloadArgs(), vmid);
+        dmaReadVirtForVMID(preload_addr, preload_size, cb, task->preloadArgs(),
+                           vmid);
     } else {
         // Read from GPU memory manager one cache line at a time to prevent
         // rare cases where the preload data spans two memory pages.
         constexpr unsigned alignment_granularity = 64;
-        ChunkGenerator gen(preload_addr,
-                sizeof(uint32_t) * akc->kernarg_preload_spec_length,
-                alignment_granularity);
+        ChunkGenerator gen(preload_addr, preload_size, alignment_granularity);
+
+        auto *dispatchReadCtx = new KernelDispatchReadContext;
+        dispatchReadCtx->dispatchData.akc = akc;
+        dispatchReadCtx->dispatchData.task = task;
+        dispatchReadCtx->dispatchType =
+            ComputeUnit::SQCPort::SenderState::DISPATCH_PRELOAD_ARG;
 
         for (; !gen.done(); gen.next()) {
             Addr chunk_addr = gen.addr();
@@ -922,19 +945,15 @@ GPUCommandProcessor::readPreload(AMDKernelCode *akc, HSAQueueEntry *task)
                 dummy, BaseMMU::Mode::Read, is_system_page);
 
             Request::Flags flags = Request::PHYSICAL;
-            RequestPtr request = std::make_shared<Request>(chunk_addr,
-                alignment_granularity, flags,
-                walker->getDevRequestor());
+            RequestPtr request = std::make_shared<Request>(
+                chunk_addr, gen.size(), flags, walker->getDevRequestor());
 
             PacketPtr readPkt = new Packet(request, MemCmd::ReadReq);
             readPkt->dataStatic((uint8_t *)task->preloadArgs()
                                  + gen.complete());
 
-            struct KernelDispatchData dispatchData;
-            dispatchData.akc = akc;
-            dispatchData.task = task;
-            dispatchData.readPkt = readPkt;
-            kernelDispatchList.push_back(dispatchData);
+            ++dispatchReadCtx->pendingReads;
+            kernelDispatchReads[readPkt] = dispatchReadCtx;
             performTimingRead(readPkt,
                 ComputeUnit::SQCPort::SenderState::DISPATCH_PRELOAD_ARG);
         }
