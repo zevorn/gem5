@@ -555,6 +555,13 @@ if __name__ == "__m5_main__":
 
     args = parser.parse_args()
 
+    if not hasattr(m5.objects, "MI300XVfioUser"):
+        m5.util.fatal(
+            "MI300XVfioUser is unavailable. Initialize ext/libvfio-user "
+            "with 'git submodule update --init ext/libvfio-user' and "
+            "rebuild gem5."
+        )
+
     # Cosim defaults
     args.num_cpus = 1
     args.cpu_type = "AtomicSimpleCPU"
