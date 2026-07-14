@@ -38,9 +38,7 @@ namespace gem5
 {
 
 /**
- * Abstract interface for QEMU <-> gem5 co-simulation bridges.
- * Implemented by MI300XGem5Cosim (custom protocol) and
- * MI300XVfioUser (standard vfio-user protocol).
+ * Abstract interface for the QEMU <-> gem5 vfio-user bridge.
  */
 class CosimBridge
 {

@@ -53,12 +53,7 @@ Source('pm4_packet_processor.cc', tags=['x86 isa'])
 Source('sdma_engine.cc', tags=['x86 isa'])
 Source('system_hub.cc', tags=['x86 isa'])
 
-# MI300X co-simulation with QEMU (legacy custom protocol)
-SimObject('MI300XGem5Cosim.py', sim_objects=['MI300XGem5Cosim'],
-                                tags=['x86 isa'])
-Source('mi300x_gem5_cosim.cc', tags=['x86 isa'])
-
-# MI300X co-simulation via vfio-user protocol (standard, replaces above)
+# MI300X co-simulation via the standard vfio-user protocol
 if File('#ext/libvfio-user/include/libvfio-user.h').exists():
     SimObject('MI300XVfioUser.py', sim_objects=['MI300XVfioUser'],
                                    tags=['x86 isa'])

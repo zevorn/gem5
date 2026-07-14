@@ -96,13 +96,6 @@ def addCosimOptions(parser):
         help="POSIX shared memory name for host (guest) RAM",
     )
     parser.add_argument(
-        "--cosim-backend",
-        type=str,
-        choices=["vfio-user", "legacy"],
-        default="vfio-user",
-        help="Co-simulation backend: vfio-user (standard) or legacy (custom)",
-    )
-    parser.add_argument(
         "--num-gpus",
         type=int,
         default=1,
@@ -481,29 +474,17 @@ def buildCosimSystem(args):
     # ----------------------------------------------------------------
     # Co-simulation bridges
     # ----------------------------------------------------------------
-    backend = getattr(args, "cosim_backend", "vfio-user")
-    if backend != "vfio-user" and num_gpus > 1:
-        m5.util.panic("Multi-GPU only supports vfio-user backend")
-
     cosim_bridges = []
     for gpu_id in range(num_gpus):
         sock = _gpu_socket_path(args.socket_path, gpu_id, num_gpus)
         shmem = _gpu_shmem_path(args.shmem_path, gpu_id, num_gpus)
 
-        if backend == "vfio-user":
-            bridge = MI300XVfioUser(
-                gpu_device=gpu_devices[gpu_id],
-                socket_path=sock,
-                shmem_path=shmem,
-                vram_size=args.dgpu_mem_size,
-            )
-        else:
-            bridge = MI300XGem5Cosim(
-                gpu_device=gpu_devices[gpu_id],
-                socket_path=sock,
-                shmem_path=shmem,
-                vram_size=args.dgpu_mem_size,
-            )
+        bridge = MI300XVfioUser(
+            gpu_device=gpu_devices[gpu_id],
+            socket_path=sock,
+            shmem_path=shmem,
+            vram_size=args.dgpu_mem_size,
+        )
         cosim_bridges.append(bridge)
 
     # Assign bridges to system
@@ -606,10 +587,9 @@ if __name__ == "__m5_main__":
 
     m5.instantiate()
 
-    backend = getattr(args, "cosim_backend", "vfio-user")
     print("=" * 60)
     print("gem5 MI300X co-simulation server ready")
-    print(f"  Backend:    {backend}")
+    print("  Backend:    vfio-user")
     print(f"  Num GPUs:   {num_gpus}")
     for gpu_id in range(num_gpus):
         sock = _gpu_socket_path(args.socket_path, gpu_id, num_gpus)
