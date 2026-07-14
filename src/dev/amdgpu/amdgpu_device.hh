@@ -67,7 +67,6 @@ class AMDGPUDevice : public PciEndpoint
 {
     // Allow co-simulation bridges to call readDoorbell/writeDoorbell/
     // readFrame/writeFrame directly for proper BAR-level forwarding.
-    friend class MI300XGem5Cosim;
     friend class MI300XVfioUser;
 
   private:

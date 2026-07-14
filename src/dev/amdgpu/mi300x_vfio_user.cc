@@ -690,7 +690,7 @@ MI300XVfioUser::cleanupSharedMemory()
 }
 
 // ======================================================================
-// GPU device forwarding — identical to MI300XGem5Cosim
+// GPU device forwarding
 // ======================================================================
 
 uint64_t
